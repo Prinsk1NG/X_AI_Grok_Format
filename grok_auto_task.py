@@ -146,6 +146,8 @@ def save_and_renew_session(context):
             f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/secrets/SUPER_GROK_COOKIES",
             headers=headers, json={"encrypted_value": enc_b64, "key_id": key_data["key_id"]}, timeout=30
         )
+        if put_resp.status_code == 422:
+            print("[Session] WARNING: 422 错误。如果你用的是 Fine-Grained Token，请务必去 GitHub 给这个 Token 添加 'Secrets' 的 Read and Write 权限！", flush=True)
         put_resp.raise_for_status()
         print("[Session] OK GitHub Secret SUPER_GROK_COOKIES auto-renewed", flush=True)
     except Exception as e:
@@ -207,24 +209,25 @@ def open_grok_page(context):
         return None
 
 def send_prompt(page, prompt_text, label):
-    page.wait_for_selector("div[contenteditable='true'], textarea", timeout=30000)
-    ok = page.evaluate("""(text) => { const el = document.querySelector("div[contenteditable='true']") || document.querySelector("textarea"); if (!el) return false; el.focus(); document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); document.execCommand('insertText', false, text); return el.textContent.length > 0 || el.value?.length > 0; }""", prompt_text)
-    if not ok:
-        inp = page.query_selector("div[contenteditable='true'], textarea")
-        if inp:
-            inp.click()
-            page.keyboard.press("Control+a")
-            page.keyboard.press("Backspace")
-            for i in range(0, len(prompt_text), 500):
-                page.keyboard.type(prompt_text[i:i+500])
-                time.sleep(0.2)
-    time.sleep(1.5)
     try:
-        send_btn = page.wait_for_selector("button[aria-label='Submit']:not([disabled]), button[aria-label='Send message']:not([disabled]), button[type='submit']:not([disabled])", timeout=30000, state="visible")
-        send_btn.click()
+        # 等待输入框
+        page.wait_for_selector("textarea", timeout=30000)
+        locator = page.locator("textarea").first
+        locator.fill(prompt_text)
+        time.sleep(1)
+        
+        # 兜底：按下回车发送
+        page.keyboard.press("Enter")
+        time.sleep(1)
+        
+        # 点击发送按钮 (强制触发React)
+        page.evaluate("""() => { 
+            const btn = document.querySelector("button[aria-label='Submit'], button[aria-label*='Send'], button[type='submit'], button[aria-label='Grok something']"); 
+            if (btn && !btn.disabled) btn.click(); 
+        }""")
+        print(f"[{label}] OK Prompt Sent", flush=True)
     except Exception as e:
-        page.evaluate("""() => { const btn = document.query_selector("button[type='submit']") || document.query_selector("button[aria-label='Submit']") || document.query_selector("button[aria-label='Send message']"); if (btn) btn.click(); }""")
-    print(f"[{label}] OK Prompt Sent", flush=True)
+        print(f"[{label}] WARNING Prompt issue: {e}", flush=True)
     time.sleep(5)
 
 def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, extend_if_growing=False, min_len=80):
@@ -232,8 +235,17 @@ def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, ext
     while elapsed < max_wait:
         time.sleep(interval)
         elapsed += interval
-        try: text = page.evaluate("""() => { const msgs = document.querySelectorAll('[data-testid="message"], .message-bubble, .response-content'); return msgs.length ? msgs[msgs.length - 1].innerText : ""; }""")
+        try: text = page.evaluate("""() => { 
+            const msgs = Array.from(document.querySelectorAll('.message, [data-testid="message"], .message-bubble, .response-content'));
+            if (msgs.length === 0) return "";
+            return msgs[msgs.length - 1].innerText; 
+        }""")
         except: return last_text.strip()
+        
+        # 🚨 屏蔽提取自身的 Prompt：如果抓到的是我们自己发的话，说明 Grok 还没开始生成，继续等！
+        if text and "You are an X/Twitter data collection tool" in text:
+            continue
+            
         last_text = text
         cur_len = len(text.strip())
         if cur_len == last_len and cur_len >= min_len:
