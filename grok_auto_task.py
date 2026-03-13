@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-grok_auto_task.py  v8.7 (硅谷100人：反防爬自然语言伪装版 + 专家模式 + xAI)
-Architecture: Playwright(Grok Web NLP Masking) -> Regex Parsing -> xAI SDK -> Feishu
+grok_auto_task.py  v8.8 (终极防封：无限接力 + 专家模式 + 彻底的自然语言伪装)
 """
 
 import os
@@ -79,6 +78,21 @@ def get_available_cookies():
         if val: configs.append({"env_key": key, "value": val})
     return configs
 
+def check_cookie_expiry(cookie_configs):
+    for cfg in cookie_configs:
+        try:
+            data = json.loads(cfg["value"])
+            if not isinstance(data, list): continue
+            watched_names = {"sso", "auth_token", "ct0"}
+            for c in data:
+                cname = c.get("name", "")
+                if cname in watched_names and c.get("expirationDate"):
+                    exp = datetime.fromtimestamp(c["expirationDate"], tz=timezone.utc)
+                    days_left = (exp - datetime.now(timezone.utc)).days
+                    if days_left <= 5:
+                        print(f"[Cookie] Warning: 账号 {cfg['env_key']} 中的核心 Cookie 将在 {days_left} 天后过期！", flush=True)
+        except: pass
+
 def create_browser_context(browser, cookie_config):
     ctx = browser.new_context(viewport={"width": 1280, "height": 800}, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", locale="zh-CN")
     try:
@@ -88,6 +102,25 @@ def create_browser_context(browser, cookie_config):
         print(f"[Session] OK Loaded {cookie_config['env_key']}", flush=True)
     except: pass
     return ctx
+
+def save_and_renew_session(context, env_key):
+    if not PAT_FOR_SECRETS or not GITHUB_REPOSITORY: return
+    try:
+        from nacl import encoding, public as nacl_public
+        cookies = context.cookies()
+        state_str = json.dumps(cookies)
+        repo_name = GITHUB_REPOSITORY.strip().strip("/")
+        headers = {"Authorization": f"Bearer {PAT_FOR_SECRETS.strip()}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+        key_url = f"https://api.github.com/repos/{repo_name}/actions/secrets/public-key"
+        key_resp = requests.get(key_url, headers=headers, timeout=30)
+        if key_resp.status_code != 200: return
+        key_data = key_resp.json()
+        pub_key = nacl_public.PublicKey(key_data["key"].encode(), encoding.Base64Encoder())
+        sealed  = nacl_public.SealedBox(pub_key).encrypt(state_str.encode())
+        enc_b64 = base64.b64encode(sealed).decode()
+        put_url = f"https://api.github.com/repos/{repo_name}/actions/secrets/{env_key}"
+        requests.put(put_url, headers=headers, json={"encrypted_value": enc_b64, "key_id": key_data["key_id"]}, timeout=30)
+    except: pass
 
 def select_expert_mode(page):
     print("\n[Model] Switching to Expert Mode...", flush=True)
@@ -113,7 +146,7 @@ def open_grok_page(context, env_key):
     except: return None
 
 def send_prompt(page, prompt_text, label):
-    """最底层的盲切剪贴板，绝对穿透"""
+    """底层注入，防拦截"""
     try:
         time.sleep(2) 
         page.evaluate("""(text) => {
@@ -126,7 +159,6 @@ def send_prompt(page, prompt_text, label):
         page.keyboard.press("Control+c")
         time.sleep(0.5)
         
-        # 寻找光标点
         page.evaluate("""() => {
             const el = document.querySelector('.ProseMirror') || document.querySelector("textarea") || document.querySelector("div[contenteditable='true']");
             if(el) el.focus();
@@ -138,9 +170,10 @@ def send_prompt(page, prompt_text, label):
         page.keyboard.press("Enter")
         time.sleep(1)
         page.evaluate("() => { const btns = Array.from(document.querySelectorAll('button')); const sendBtn = btns.find(b => b.getAttribute('aria-label') && b.getAttribute('aria-label').includes('Send')); if (sendBtn) sendBtn.click(); }")
+        print(f"[{label}] OK Prompt Sent (Forced)", flush=True)
     except: pass
 
-def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, extend_if_growing=False, min_len=80):
+def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, min_len=40):
     last_len, stable, elapsed, last_text = -1, 0, 0, ""
     while elapsed < max_wait:
         time.sleep(interval)
@@ -148,7 +181,7 @@ def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, ext
         try: 
             text = page.evaluate("""() => { 
                 const msgs = Array.from(document.querySelectorAll('.prose, .markdown, [data-testid="assistant-message"]'));
-                const ai_msgs = msgs.filter(m => !m.innerText.includes('Please help me organize'));
+                const ai_msgs = msgs.filter(m => !m.innerText.includes('Please act as my research assistant'));
                 if (ai_msgs.length === 0) return "";
                 return ai_msgs[ai_msgs.length - 1].innerText; 
             }""")
@@ -156,25 +189,24 @@ def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, ext
         last_text = text
         cur_len = len(text.strip())
         
-        # 🚨 V8.7 放宽判定条件，只要长度足够就认为开始生成了
         if cur_len == last_len and cur_len >= min_len:
             stable += 1
             if stable >= stable_rounds: return text.strip()
         else:
             stable = 0
             last_len = cur_len
+            
+    page.screenshot(path=f"data/debug_{label}_timeout.png")
     return last_text.strip()
 
 # ==============================================================================
-# 🚨 V8.7 核心黑科技：自然语言伪装与提取器
+# 🚨 V8.8 核心：伪装成人类助理的自然语言提示词（彻底放弃JSON防封号）
 # ==============================================================================
 def parse_nlp_to_jsonl(text: str) -> list:
-    """把大模型生成的半结构化自然文本提取为我们的标准字典列表"""
+    """把大模型生成的半结构化自然文本解析为标准数据"""
     results = []
     
-    # 提取 Posts
-    # 格式预期: @账号名 || 1000 || 0313 || 这是一段总结
-    post_pattern = re.compile(r'@([a-zA-Z0-9_]+)\s*\|\|\s*(\d+)\s*\|\|\s*(\d{4})\s*\|\|\s*(.*?)(?=\n@|\n###|\n$)', re.IGNORECASE | re.DOTALL)
+    post_pattern = re.compile(r'@([a-zA-Z0-9_]+)\s*\|\|\s*(\d+)\s*\|\|\s*(\d{4})\s*\|\|\s*(.*?)(?=\n@|\nMETA|\n$)', re.IGNORECASE | re.DOTALL)
     for match in post_pattern.finditer(text):
         results.append({
             "a": match.group(1).strip(),
@@ -184,8 +216,6 @@ def parse_nlp_to_jsonl(text: str) -> list:
             "tag": "raw"
         })
         
-    # 提取 Meta
-    # 格式预期: META: @账号名 || 10 || 5000 || 0313
     meta_pattern = re.compile(r'META:\s*@([a-zA-Z0-9_]+)\s*\|\|\s*(\d+)\s*\|\|\s*(\d+)\s*\|\|\s*([0-9NAa-zA-Z]+)', re.IGNORECASE)
     for match in meta_pattern.finditer(text):
         results.append({
@@ -202,31 +232,31 @@ def build_phase1_prompt(accounts: list) -> str:
     rounds = [accounts[i:i+3] for i in range(0, len(accounts), 3)]
     rounds_text = "\n".join(f"Round {i+1}: {' | '.join(r)}" for i, r in enumerate(rounds))
     return (
-        "Please help me organize some recent tweets from specific users. Search them one by one and format the output like a simple text list, NOT code, NOT json.\n\n"
+        "Please act as my research assistant. Search the following Twitter users one by one and format the output like a simple text list, NOT code, NOT json.\n\n"
         "Here is what you need to do:\n"
-        "1. Use search to find latest tweets from these users.\n"
+        "1. Find their latest tweets.\n"
         "2. For each user, give me their 3 newest tweets in this exact text format:\n"
         "@AccountName || LikesCount || MMDD || English summary of the tweet\n"
         "3. After their tweets, add ONE line about their activity level in this exact format:\n"
         "META: @AccountName || TotalPostsCount || MaxLikesCount || LatestPostMMDD\n\n"
         f"The users are:\n{rounds_text}\n\n"
-        "Just output the formatted text lines. Do not wrap in markdown code blocks. Keep it simple and natural."
+        "Just output the formatted text lines. Do not wrap in markdown code blocks."
     )
 
 def build_phase2_s_prompt(accounts: list) -> str:
     rounds_text = "\n".join(f"Round 1: {' | '.join(accounts)}")
     return (
-        "Please help me summarize recent high-quality tweets from these specific users. Format the output like a simple text list, NOT code, NOT json.\n\n"
+        "Please act as my research assistant. Summarize recent high-quality tweets from these specific users. Format the output like a simple text list, NOT code, NOT json.\n\n"
         "Here is what you need to do:\n"
-        "1. Use search to find their latest tweets.\n"
+        "1. Search to find their latest tweets.\n"
         "2. For each user, give me up to 10 newest tweets in this exact text format:\n"
         "@AccountName || LikesCount || MMDD || English summary of the tweet\n\n"
         f"The users are:\n{rounds_text}\n\n"
-        "Just output the formatted text lines. Do not wrap in markdown code blocks. Keep it natural."
+        "Just output the formatted text lines. Do not wrap in markdown code blocks."
     )
 
 def build_phase2_a_prompt(accounts: list) -> str:
-    return build_phase2_s_prompt(accounts) # A 级由于降低了额度，其实可以直接复用 S 级的自然语言 Prompt
+    return build_phase2_s_prompt(accounts)
 
 def run_grok_batch_with_relay(browser, cookie_configs, accounts: list, prompt_builder, label: str):
     if not accounts: return []
@@ -256,7 +286,6 @@ def run_grok_batch_with_relay(browser, cookie_configs, accounts: list, prompt_bu
             print(f"[{label}] 等待 Grok 处理...", flush=True)
             raw_text = wait_and_extract(page, label, interval=5, stable_rounds=4, max_wait=300, min_len=40)
             
-            # 🚨 重点：通过正则解析自然语言提取数据
             results = parse_nlp_to_jsonl(raw_text)
             
             if len(results) > 0:
@@ -264,7 +293,7 @@ def run_grok_batch_with_relay(browser, cookie_configs, accounts: list, prompt_bu
                 page.close(); context.close()
                 return results
             else:
-                print(f"[{label}] ⚠️ 提取到 0 条记录。Grok 的原文是: \n{raw_text[:200]}...", flush=True)
+                print(f"[{label}] ⚠️ 提取到 0 条记录。可能遭遇风控或限流。", flush=True)
                 page.close(); context.close()
                 _current_cookie_idx = (_current_cookie_idx + 1) % len(cookie_configs)
                 attempts += 1
@@ -392,7 +421,7 @@ def main():
     global _current_cookie_idx
     print("=" * 60, flush=True)
     mode_str = "测试模式(6人)" if TEST_MODE else "全量模式"
-    print(f"硅谷百人雷达 v8.7 (自然语言伪装防封版 - {mode_str})", flush=True)
+    print(f"硅谷百人雷达 v8.8 (自然语言防封版 - {mode_str})", flush=True)
     print("=" * 60, flush=True)
 
     today_str, _ = get_dates()
@@ -442,7 +471,7 @@ def main():
         if xml_result:
             parsed = parse_llm_xml(xml_result)
             render_feishu_card(parsed, today_str)
-            print("\n🎉 V8.7 运行完毕！", flush=True)
+            print("\n🎉 V8.8 运行完毕！", flush=True)
         else:
             print("❌ LLM 处理失败。")
 
