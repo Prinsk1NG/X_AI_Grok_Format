@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-grok_auto_task.py  v8.5 (硅谷100人：多号无限接力版 + 专家模式直驱 + xAI排版)
+grok_auto_task.py  v8.6 (硅谷100人：多号接力 + 专家模式 + xAI排版 + 修复校验Bug)
 Architecture: Playwright(Grok Web Multi-Account) -> JSONL -> xAI SDK -> Feishu/WeChat
 """
 
@@ -85,6 +85,22 @@ def get_available_cookies():
         if val:
             configs.append({"env_key": key, "value": val})
     return configs
+
+# 🚨 补回了误删的 Cookie 过期检查函数，并升级为支持多号检查
+def check_cookie_expiry(cookie_configs):
+    for cfg in cookie_configs:
+        try:
+            data = json.loads(cfg["value"])
+            if not isinstance(data, list): continue
+            watched_names = {"sso", "auth_token", "ct0"}
+            for c in data:
+                cname = c.get("name", "")
+                if cname in watched_names and c.get("expirationDate"):
+                    exp = datetime.fromtimestamp(c["expirationDate"], tz=timezone.utc)
+                    days_left = (exp - datetime.now(timezone.utc)).days
+                    if days_left <= 5:
+                        print(f"[Cookie] Warning: 账号 {cfg['env_key']} 中的核心 Cookie '{cname}' 将在 {days_left} 天后过期！", flush=True)
+        except: pass
 
 def create_browser_context(browser, cookie_config):
     """根据指定的 Cookie 创建独立的浏览器上下文"""
@@ -498,7 +514,7 @@ def llm_call_xai(combined_jsonl: str, today_str: str) -> str:
             print(f"[LLM/xAI] OK Response received ({len(result)} chars)", flush=True)
             return result
         except Exception as e: 
-            print(f"[LLM/xAI] attempt {attempt} failed: {e}")
+            print(f"[LLM/xAI] attempt {attempt} failed: {e}", flush=True)
             time.sleep(2 ** attempt)
     return ""
 
@@ -720,12 +736,11 @@ def main():
     global _current_cookie_idx
     print("=" * 60, flush=True)
     mode_str = "测试模式(1个Batch-6人)" if TEST_MODE else "全量模式"
-    print(f"昨晚硅谷在聊啥 v8.5 (无限接力版 + 专家模式直驱 + xAI提纯 - {mode_str})", flush=True)
+    print(f"昨晚硅谷在聊啥 v8.6 (无限接力版 + 专家模式直驱 + xAI提纯 - {mode_str})", flush=True)
     print("=" * 60, flush=True)
 
     today_str, _ = get_dates()
     Path("data").mkdir(exist_ok=True)
-    check_cookie_expiry()
     
     # 🚨 1. 装载所有的 Cookie 配置 (支持 SUPER_GROK_COOKIES 到 SUPER_GROK_COOKIES_5)
     cookie_configs = get_available_cookies()
@@ -733,6 +748,9 @@ def main():
         print("💥 致命错误：未找到任何 SUPER_GROK_COOKIES 环境变量！", flush=True)
         return
     print(f"🔑 成功装载 {len(cookie_configs)} 个 Grok 账号，准备开启无限接力抓取！", flush=True)
+    
+    # 检查是否即将过期
+    check_cookie_expiry(cookie_configs)
 
     selected_accounts = ALL_ACCOUNTS[:6] if TEST_MODE else ALL_ACCOUNTS
     meta_results, phase1_posts, phase2_posts = {}, {}, {}
@@ -809,7 +827,7 @@ def main():
                 
             save_daily_data(today_str, all_posts_flat, xml_result)
             
-            print("\n🎉 V8.5 运行完毕！", flush=True)
+            print("\n🎉 V8.6 运行完毕！", flush=True)
         else:
             print("❌ LLM 处理失败，任务终止。")
 
