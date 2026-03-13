@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-grok_auto_task.py  v8.1 (硅谷 100 人：Grok Web UI 抓取 + xAI SDK XML 深度提纯)
+grok_auto_task.py  v8.2 (带“行车记录仪”的截图调试版)
 Architecture: Playwright(Grok Web) -> JSONL -> xAI SDK (XML Prompt) -> Feishu/WeChat UI
 """
 
@@ -128,38 +128,32 @@ def save_and_renew_session(context):
         with open("session_state.json", "r", encoding="utf-8") as f:
             state_str = f.read()
 
-        # 🚨 确保 GITHUB_REPOSITORY 没有多余的空格或斜杠
         repo_name = GITHUB_REPOSITORY.strip().strip("/")
-        
         headers = {
             "Authorization": f"Bearer {PAT_FOR_SECRETS.strip()}", 
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28"
         }
         
-        # 1. 获取公钥
         key_url = f"https://api.github.com/repos/{repo_name}/actions/secrets/public-key"
         key_resp = requests.get(key_url, headers=headers, timeout=30)
         
         if key_resp.status_code != 200:
-            print(f"[Session] WARNING: 无法获取公钥。状态码: {key_resp.status_code}. 请检查 PAT 是否有 'Secrets: Read and write' 权限，且仓库名 {repo_name} 是否正确。", flush=True)
+            print(f"[Session] WARNING: 无法获取公钥。状态码: {key_resp.status_code}. 请检查 PAT 是否有 'repo' 权限，且仓库名 {repo_name} 是否正确。", flush=True)
             return
             
         key_data = key_resp.json()
-
-        # 2. 加密
         pub_key = nacl_public.PublicKey(key_data["key"].encode(), encoding.Base64Encoder())
         sealed  = nacl_public.SealedBox(pub_key).encrypt(state_str.encode())
         enc_b64 = base64.b64encode(sealed).decode()
 
-        # 3. 更新 Secret
         put_url = f"https://api.github.com/repos/{repo_name}/actions/secrets/SUPER_GROK_COOKIES"
         payload = {"encrypted_value": enc_b64, "key_id": key_data["key_id"]}
         
         put_resp = requests.put(put_url, headers=headers, json=payload, timeout=30)
         
         if put_resp.status_code == 422:
-            print("[Session] ERROR: 422 错误！API 请求体无法处理。请绝对确认你的 Token 是 Fine-Grained Token，并且具备对该仓库的 'Secrets' 读写权限！", flush=True)
+            print("[Session] ERROR: 422 错误！API 请求体无法处理。如果你用了 Fine-Grained，请换回 Classic Token，并勾选 repo 权限！", flush=True)
         elif put_resp.status_code in [201, 204]:
             print("[Session] OK GitHub Secret SUPER_GROK_COOKIES auto-renewed", flush=True)
         else:
@@ -211,46 +205,71 @@ def open_grok_page(context):
     page = context.new_page()
     try:
         page.goto("https://grok.com", wait_until="domcontentloaded", timeout=60000)
-        time.sleep(5) # 给首页多点时间加载前端框架
+        time.sleep(5) 
+        
+        # 🚨 第一张截图：首页加载后
+        Path("data").mkdir(exist_ok=True)
+        page.screenshot(path="data/debug_01_grok_homepage.png")
+        print("[Debug] Homepage screenshot saved to data/debug_01_grok_homepage.png", flush=True)
+        
         if _is_login_page(page.url):
             print("ERROR: Not logged in - session expired", flush=True)
+            page.screenshot(path="data/debug_02_login_failed.png")
             page.close()
             return None
         enable_grok4_beta(page)
         return page
     except Exception as e:
+        print(f"[Debug] open_grok_page error: {e}", flush=True)
         try: page.close()
         except: pass
         return None
 
 def send_prompt(page, prompt_text, label):
     """
-    V8.3 纯正硬件级模拟：放弃一切 JS 注入，完全使用键盘交互！
+    改进的输入策略与拦截兜底
     """
     try:
-        time.sleep(3) # 等待页面完全稳定
+        time.sleep(3) 
         
-        # 1. 尝试找到页面上的输入框，使用 Playwright 原生的 fill
-        # 我们寻找各种可能作为输入框的元素，并优先点击它以获取焦点
-        input_locator = page.locator("textarea, .ProseMirror, div[contenteditable='true']").last
+        # 🚨 第二张截图：输入前的状态
+        page.screenshot(path=f"data/debug_{label}_before_input.png")
         
-        try:
-            # 尝试点击它
-            input_locator.click(timeout=5000)
-            time.sleep(0.5)
-        except:
-            # 如果点不到，盲按几下 Tab 试试运气
+        # 寻找广泛的输入框元素
+        selectors = [
+            "div.ProseMirror[contenteditable='true']",
+            "div[data-placeholder*='Message'][contenteditable='true']",
+            "textarea:not([hidden]):not([aria-hidden='true'])"
+        ]
+        
+        input_locator = None
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                locator.wait_for(state="visible", timeout=3000)
+                input_locator = locator
+                print(f"[{label}] Found input field with selector: {selector}", flush=True)
+                break
+            except Exception:
+                continue
+
+        if input_locator:
+            try:
+                input_locator.click()
+                time.sleep(0.5)
+            except Exception as click_err:
+                 print(f"[{label}] Could not click input field: {click_err}", flush=True)
+        else:
+            print(f"[{label}] WARNING: Could not find visible input field.", flush=True)
             for _ in range(3):
                 page.keyboard.press("Tab")
-                time.sleep(0.1)
+                time.sleep(0.2)
                 
-        # 2. 清空可能存在的内容
         page.keyboard.press("Control+a")
         page.keyboard.press("Backspace")
         time.sleep(0.5)
         
-        # 3. 🚨 暴力打字机：利用剪贴板机制（规避 JS 注入拦截）
-        # 将长文本放入页面的一个隐藏元素中，然后用 JS 选中它，执行复制，再通过键盘执行粘贴。
+        # 暴力打字机：剪贴板挂载
         page.evaluate("""(text) => {
             const ta = document.createElement('textarea');
             ta.id = 'hacker_clipboard';
@@ -260,28 +279,21 @@ def send_prompt(page, prompt_text, label):
             document.body.appendChild(ta);
         }""", prompt_text)
         
-        # 让隐藏的 textarea 获取焦点并全选
         page.evaluate("""() => {
             const ta = document.getElementById('hacker_clipboard');
             ta.select();
         }""")
         
-        # 执行系统级复制
         page.keyboard.press("Control+c")
         time.sleep(0.5)
         
-        # 焦点切回刚才尝试获取的真实输入框
-        try:
-            input_locator.click()
-        except:
-            pass # 如果点不到就顺其自然，希望焦点是对的
+        if input_locator:
+            try: input_locator.click()
+            except: pass
             
-        # 执行系统级粘贴
         page.keyboard.press("Control+v")
         time.sleep(1)
         
-        # 兜底：如果剪贴板策略失败，用真实的打字 API 强行输入（为了速度，只在失败时用）
-        # 我们检查一下输入框里有没有东西
         has_content = page.evaluate("""() => {
             const el = document.activeElement;
             if (!el) return false;
@@ -290,31 +302,31 @@ def send_prompt(page, prompt_text, label):
         
         if not has_content:
              print(f"[{label}] 剪贴板失效，启用逐字硬敲模式...", flush=True)
-             page.keyboard.type(prompt_text, delay=0.5) # 极快打字
+             page.screenshot(path=f"data/debug_{label}_clipboard_failed.png")
+             page.keyboard.type(prompt_text, delay=0.01)
              time.sleep(1)
              
-        # 清理垃圾
         page.evaluate("""() => {
             const ta = document.getElementById('hacker_clipboard');
             if(ta) ta.remove();
         }""")
 
-        # 4. 发送！
         page.keyboard.press("Enter")
         time.sleep(1)
         
-        # 发送按钮双保险
         try:
-             # 尝试寻找提交按钮并强制点击
              send_btn = page.locator("button[type='submit'], button[aria-label*='Send'], button[aria-label*='Submit']").last
-             send_btn.click(timeout=3000, force=True)
+             send_btn.click(timeout=2000, force=True)
         except:
              pass
              
-        print(f"[{label}] OK Prompt Sent (Hardware Sim)", flush=True)
+        print(f"[{label}] OK Prompt Sent", flush=True)
     except Exception as e:
         print(f"[{label}] WARNING Prompt issue: {e}", flush=True)
-    time.sleep(8) # 多等一会儿，让它飞一会
+        # 🚨 第三张截图：报错时的界面
+        try: page.screenshot(path=f"data/debug_{label}_exception.png")
+        except: pass
+    time.sleep(8)
 
 def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, extend_if_growing=False, min_len=80):
     last_len, stable, elapsed, last_text = -1, 0, 0, ""
@@ -323,11 +335,8 @@ def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, ext
         elapsed += interval
         try: 
             text = page.evaluate("""() => { 
-                // 排除用户自己发送的 prompt，只抓取 AI 返回的块
                 const msgs = Array.from(document.querySelectorAll('.message, [data-testid="message"], .message-bubble, .response-content, .ProseMirror-widget'));
-                // 过滤掉包含我们特征词的块
                 const ai_msgs = msgs.filter(m => !m.innerText.includes('You are an X/Twitter data collection tool'));
-                
                 if (ai_msgs.length === 0) return "";
                 return ai_msgs[ai_msgs.length - 1].innerText; 
             }""")
@@ -337,22 +346,21 @@ def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, ext
         last_text = text
         cur_len = len(text.strip())
         
-        # 只有抓到有效的 JSON 行格式，才认为开始稳定
         if cur_len == last_len and cur_len >= min_len and "{" in text and "}" in text:
             stable += 1
             if stable >= stable_rounds: return text.strip()
         else:
             stable = 0
             last_len = cur_len
+            
+    # 如果超时了，截取一张最后状态的图
+    page.screenshot(path=f"data/debug_{label}_timeout.png")
     return last_text.strip()
 
-# 🚨 终极修复：使用正则的 {3} 替代三个反引号，避免语法截断！
 def parse_jsonlines(text: str) -> list:
     results = []
-    # 去除可能存在的 markdown 包装块
     text = re.sub(r'^`{3}(?:jsonl|json)?\n', '', text, flags=re.MULTILINE)
     text = re.sub(r'^`{3}\n?', '', text, flags=re.MULTILINE)
-    
     for line in text.splitlines():
         line = line.strip()
         if not line or not line.startswith('{') or not line.endswith('}'): continue
@@ -361,7 +369,7 @@ def parse_jsonlines(text: str) -> list:
     return results
 
 # ==============================================================================
-# 🤖 抓取策略 Prompts (完全恢复附件原始逻辑)
+# 🤖 抓取策略 Prompts 
 # ==============================================================================
 def build_phase1_prompt(accounts: list) -> str:
     rounds = [accounts[i:i+3] for i in range(0, len(accounts), 3)]
@@ -416,7 +424,6 @@ def run_grok_batch(context, accounts: list, prompt_builder, label: str) -> list:
         raw_text = wait_and_extract(page, label, interval=5, stable_rounds=5, max_wait=420, extend_if_growing=True, min_len=50)
         results = parse_jsonlines(raw_text)
         
-        # 🚨 透视镜：如果解析出 0 条数据，直接把原话打出来，看看 Grok 到底说了什么鬼话
         if len(results) == 0:
             print(f"\n[{label}] ⚠️ 警告：解析到 0 条 JSON！Grok 的原始回复是：\n{raw_text[:800]}...\n", flush=True)
         else:
@@ -448,7 +455,6 @@ def classify_accounts(meta_results: dict) -> dict:
         elif max_l > 800 and days_since <= 14: classification[account] = "A"
         else: classification[account] = "B"
     return classification
-
 
 # ==============================================================================
 # 🚀 第二阶段：纯 XML 提示词与 xAI 提纯 
@@ -750,7 +756,7 @@ def save_daily_data(today_str: str, post_objects: list, report_text: str):
 def main():
     print("=" * 60, flush=True)
     mode_str = "测试模式(1个Batch-6人)" if TEST_MODE else "全量模式"
-    print(f"昨晚硅谷在聊啥 v8.1 (硅谷100人 Grok网页抓取 + xAI提纯 - {mode_str})", flush=True)
+    print(f"昨晚硅谷在聊啥 v8.2 (硅谷100人 Grok网页抓取 + xAI提纯 - {mode_str})", flush=True)
     print("=" * 60, flush=True)
 
     today_str, _ = get_dates()
@@ -778,9 +784,10 @@ def main():
         # 验证登录
         verify_page = context.new_page()
         verify_page.goto("https://grok.com", wait_until="domcontentloaded", timeout=60000)
-        time.sleep(3)
+        time.sleep(5)
         if _is_login_page(verify_page.url):
-            print("ERROR: Grok Cookie expired. Update SUPER_GROK_COOKIES.", flush=True)
+            print("ERROR: Not logged in - session expired", flush=True)
+            verify_page.screenshot(path="data/debug_login_failed.png")
             browser.close()
             return
         verify_page.close()
@@ -852,9 +859,11 @@ def main():
                 
             save_daily_data(today_str, all_posts_flat, xml_result)
             
-            print("\n🎉 V8.1 运行完毕！", flush=True)
+            print("\n🎉 V8.2 运行完毕！", flush=True)
         else:
             print("❌ LLM 处理失败，任务终止。")
+
+    # 注意：我们在这里把 data 目录打包上传了（YML 里配置了），里面有运行时的截图。
 
 if __name__ == "__main__":
     main()
