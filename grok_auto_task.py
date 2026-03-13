@@ -209,23 +209,52 @@ def open_grok_page(context):
         return None
 
 def send_prompt(page, prompt_text, label):
+    """
+    终极复合输入法：结合 DOM 强注、模拟输入与模拟点击，确保穿透任何前端防御。
+    """
     try:
-        # 等待输入框
-        page.wait_for_selector("textarea", timeout=30000)
-        locator = page.locator("textarea").first
-        locator.fill(prompt_text)
+        # 第一层攻击：寻找所有的潜在输入容器
+        # 很多现代框架的输入框可能是个 div(contenteditable)
+        page.wait_for_selector("textarea, div[contenteditable='true']", timeout=30000)
+        
+        # 使用 JS 强行将内容填入可能的输入框，并触发 Input 事件
+        ok = page.evaluate("""(text) => { 
+            const el = document.querySelector("div[contenteditable='true']") || document.querySelector("textarea:not([hidden])") || document.querySelector("textarea"); 
+            if (!el) return false; 
+            el.focus(); 
+            // 如果是普通的 textarea
+            if (el.tagName.toLowerCase() === 'textarea') {
+                el.value = text;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            } else {
+                // 如果是 div
+                document.execCommand('selectAll', false, null); 
+                document.execCommand('delete', false, null); 
+                document.execCommand('insertText', false, text); 
+            }
+            return true; 
+        }""", prompt_text)
+        
         time.sleep(1)
         
-        # 兜底：按下回车发送
+        # 第二层攻击：模拟真实的键盘输入作为兜底（敲一个空格触发状态更新，然后再删掉）
+        page.keyboard.press("Space")
+        time.sleep(0.1)
+        page.keyboard.press("Backspace")
+        time.sleep(1)
+        
+        # 第三层攻击：模拟回车发送
         page.keyboard.press("Enter")
         time.sleep(1)
         
-        # 点击发送按钮 (强制触发React)
+        # 第四层攻击：强行寻找并点击发送按钮
         page.evaluate("""() => { 
             const btn = document.querySelector("button[aria-label='Submit'], button[aria-label*='Send'], button[type='submit'], button[aria-label='Grok something']"); 
             if (btn && !btn.disabled) btn.click(); 
         }""")
-        print(f"[{label}] OK Prompt Sent", flush=True)
+        
+        print(f"[{label}] OK Prompt Sent (Composite Attack)", flush=True)
     except Exception as e:
         print(f"[{label}] WARNING Prompt issue: {e}", flush=True)
     time.sleep(5)
