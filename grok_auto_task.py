@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-grok_auto_task.py  v8.4 (专家模式直驱版 + 精准 ProseMirror 适配)
-Architecture: Playwright(Grok Web) -> JSONL -> xAI SDK (XML Prompt) -> Feishu/WeChat UI
+grok_auto_task.py  v8.5 (硅谷100人：多号无限接力版 + 专家模式直驱 + xAI排版)
+Architecture: Playwright(Grok Web Multi-Account) -> JSONL -> xAI SDK -> Feishu/WeChat
 """
 
 import os
@@ -26,7 +26,6 @@ SF_API_KEY          = os.getenv("SF_API_KEY", "")
 XAI_API_KEY         = os.getenv("XAI_API_KEY", "")    
 IMGBB_API_KEY       = os.getenv("IMGBB_API_KEY", "") 
 
-GROK_COOKIES_JSON   = os.getenv("SUPER_GROK_COOKIES", "")
 PAT_FOR_SECRETS     = os.getenv("PAT_FOR_SECRETS", "")
 GITHUB_REPOSITORY   = os.getenv("GITHUB_REPOSITORY", "")
 
@@ -74,31 +73,28 @@ def get_dates() -> tuple:
     yesterday = today - timedelta(days=1)
     return today.strftime("%Y-%m-%d"), yesterday.strftime("%Y-%m-%d")
 
-
 # ==============================================================================
-# 🕸️ 网页版 Grok 自动化会话管理 (Playwright)
+# 🕸️ 网页版 Grok 自动化：多号接力与会话管理
 # ==============================================================================
-def prepare_session_file() -> bool:
-    if not GROK_COOKIES_JSON:
-        print("[Session] Warning: SUPER_GROK_COOKIES not configured", flush=True)
-        return False
-    try:
-        data = json.loads(GROK_COOKIES_JSON)
-        if isinstance(data, dict) and "cookies" in data:
-            with open("session_state.json", "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            print("[Session] OK Playwright storage-state format (renewed)", flush=True)
-            return True
-        else:
-            print(f"[Session] OK Cookie-Editor array format ({len(data)} entries)", flush=True)
-            return False
-    except Exception as e:
-        print(f"[Session] ERROR Parse failed: {e}", flush=True)
-        return False
+def get_available_cookies():
+    """获取所有配置的 Grok Cookie 账号"""
+    configs = []
+    keys = ["SUPER_GROK_COOKIES"] + [f"SUPER_GROK_COOKIES_{i}" for i in range(2, 6)]
+    for key in keys:
+        val = os.getenv(key, "").strip()
+        if val:
+            configs.append({"env_key": key, "value": val})
+    return configs
 
-def load_raw_cookies(context):
+def create_browser_context(browser, cookie_config):
+    """根据指定的 Cookie 创建独立的浏览器上下文"""
+    ctx = browser.new_context(
+        viewport={"width": 1280, "height": 800}, 
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", 
+        locale="zh-CN"
+    )
     try:
-        cookies = json.loads(GROK_COOKIES_JSON)
+        cookies = json.loads(cookie_config["value"])
         formatted = []
         for c in cookies:
             cookie = {"name": c.get("name", ""), "value": c.get("value", ""), "domain": c.get("domain", ".grok.com"), "path": c.get("path", "/")}
@@ -107,26 +103,22 @@ def load_raw_cookies(context):
             ss = c.get("sameSite", "")
             if ss in ("Strict", "Lax", "None"): cookie["sameSite"] = ss
             formatted.append(cookie)
-        context.add_cookies(formatted)
-        print(f"[Session] OK Injected {len(formatted)} cookies", flush=True)
+        ctx.add_cookies(formatted)
+        print(f"[Session] OK Loaded account via {cookie_config['env_key']}", flush=True)
     except Exception as e:
-        print(f"[Session] ERROR Cookie injection failed: {e}", flush=True)
+        print(f"[Session] ERROR Cookie injection failed for {cookie_config['env_key']}: {e}", flush=True)
+    return ctx
 
-def save_and_renew_session(context):
-    try:
-        context.storage_state(path="session_state.json")
-        print("[Session] OK Storage state saved locally", flush=True)
-    except Exception as e:
-        print(f"[Session] ERROR Save storage state failed: {e}", flush=True)
-        return
-    
+def save_and_renew_session(context, env_key):
+    """自动将刷新后的 Cookie 存回指定的 GitHub Secret"""
     if not PAT_FOR_SECRETS or not GITHUB_REPOSITORY:
         return
-
     try:
         from nacl import encoding, public as nacl_public
-        with open("session_state.json", "r", encoding="utf-8") as f:
-            state_str = f.read()
+        
+        # 直接从 Playwright 提取最新 Cookie 并序列化为 JSON
+        cookies = context.cookies()
+        state_str = json.dumps(cookies)
 
         repo_name = GITHUB_REPOSITORY.strip().strip("/")
         headers = {
@@ -139,7 +131,7 @@ def save_and_renew_session(context):
         key_resp = requests.get(key_url, headers=headers, timeout=30)
         
         if key_resp.status_code != 200:
-            print(f"[Session] WARNING: 无法获取公钥。状态码: {key_resp.status_code}. 请检查 PAT 权限及仓库名 {repo_name}。", flush=True)
+            print(f"[Session] WARNING: 无法获取公钥，无法续期 {env_key}。请检查 PAT 是否有 'repo' 权限。", flush=True)
             return
             
         key_data = key_resp.json()
@@ -147,68 +139,36 @@ def save_and_renew_session(context):
         sealed  = nacl_public.SealedBox(pub_key).encrypt(state_str.encode())
         enc_b64 = base64.b64encode(sealed).decode()
 
-        put_url = f"https://api.github.com/repos/{repo_name}/actions/secrets/SUPER_GROK_COOKIES"
+        put_url = f"https://api.github.com/repos/{repo_name}/actions/secrets/{env_key}"
         payload = {"encrypted_value": enc_b64, "key_id": key_data["key_id"]}
         
         put_resp = requests.put(put_url, headers=headers, json=payload, timeout=30)
         
-        if put_resp.status_code == 422:
-            print("[Session] ERROR: 422 错误！强烈建议你去 GitHub 删除旧的 PAT，重新生成一个【Classic Token】，并只勾选 `repo` 权限！", flush=True)
-        elif put_resp.status_code in [201, 204]:
-            print("[Session] OK GitHub Secret SUPER_GROK_COOKIES auto-renewed", flush=True)
+        if put_resp.status_code in [201, 204]:
+            print(f"[Session] OK GitHub Secret {env_key} auto-renewed", flush=True)
         else:
             print(f"[Session] ERROR: 更新 Secret 失败，状态码: {put_resp.status_code}", flush=True)
             
     except Exception as e:
         print(f"[Session] ERROR Secret renewal failed: {e}", flush=True)
 
-def check_cookie_expiry():
-    if not GROK_COOKIES_JSON: return
-    try:
-        data = json.loads(GROK_COOKIES_JSON)
-        if not isinstance(data, list): return
-        watched_names = {"sso", "auth_token", "ct0"}
-        for c in data:
-            cname = c.get("name", "")
-            if cname in watched_names and c.get("expirationDate"):
-                exp = datetime.fromtimestamp(c["expirationDate"], tz=timezone.utc)
-                days_left = (exp - datetime.now(timezone.utc)).days
-                if days_left <= 5:
-                    print(f"[Cookie] Warning: Grok Cookie '{cname}' expires in {days_left} days", flush=True)
-    except: pass
-
 def select_expert_mode(page):
-    """根据截图适配：自动寻找并切换到【专家模式】"""
+    """智能寻找并开启专家模式"""
     print("\n[Model] Switching to Expert Mode (专家模式)...", flush=True)
     try:
-        # 1. 找到当前的模型选择按钮（自动模式/快速模式）并点击
         page.evaluate("""() => {
             const btns = Array.from(document.querySelectorAll('button'));
-            const modelBtn = btns.find(b => 
-                b.innerText && (
-                    b.innerText.includes('自动模式') || b.innerText.includes('Auto') || 
-                    b.innerText.includes('快速模式') || b.innerText.includes('Fast') || 
-                    b.innerText.includes('专家模式') || b.innerText.includes('Expert')
-                )
-            );
+            const modelBtn = btns.find(b => b.innerText && (b.innerText.includes('自动模式') || b.innerText.includes('Auto') || b.innerText.includes('快速模式') || b.innerText.includes('Fast') || b.innerText.includes('专家模式') || b.innerText.includes('Expert')));
             if (modelBtn) modelBtn.click();
         }""")
         time.sleep(1)
-        
-        # 2. 在弹出的菜单中，点击【专家模式】
         page.evaluate("""() => {
             const opts = Array.from(document.querySelectorAll('div, button, [role="menuitem"], [role="option"]'));
-            const expertOpt = opts.find(o => 
-                o.innerText && (
-                    o.innerText.includes('专家模式') || 
-                    o.innerText.includes('Expert') || 
-                    o.innerText.includes('Thinks hard')
-                )
-            );
+            const expertOpt = opts.find(o => o.innerText && (o.innerText.includes('专家模式') || o.innerText.includes('Expert') || o.innerText.includes('Thinks hard')));
             if (expertOpt) expertOpt.click();
         }""")
         time.sleep(0.5)
-        page.keyboard.press("Escape") # 关闭可能的残留弹窗
+        page.keyboard.press("Escape")
         print("[Model] OK Expert Mode selected", flush=True)
     except Exception as e:
         print(f"[Model] Warning: Failed to select Expert mode: {e}", flush=True)
@@ -217,43 +177,37 @@ def _is_login_page(url: str) -> bool:
     lower = url.lower()
     return any(kw in lower for kw in ("sign", "login", "oauth", "x.com/i/flow"))
 
-def open_grok_page(context):
+def open_grok_page(context, env_key):
     page = context.new_page()
     try:
         page.goto("https://grok.com", wait_until="domcontentloaded", timeout=60000)
         time.sleep(5) 
         
         Path("data").mkdir(exist_ok=True)
-        page.screenshot(path="data/debug_01_grok_homepage.png")
+        page.screenshot(path=f"data/debug_01_homepage_{env_key}.png")
         
         if _is_login_page(page.url):
-            print("ERROR: Not logged in - session expired", flush=True)
-            page.screenshot(path="data/debug_02_login_failed.png")
+            print(f"ERROR: Account {env_key} is NOT logged in (Cookie expired).", flush=True)
             page.close()
             return None
             
-        select_expert_mode(page) # 🚨 切换为专家模式
+        select_expert_mode(page)
         return page
     except Exception as e:
-        print(f"[Debug] open_grok_page error: {e}", flush=True)
         try: page.close()
         except: pass
         return None
 
 def send_prompt(page, prompt_text, label):
-    """
-    精准打击 ProseMirror 富文本框，彻底消灭 Timeout。
-    """
+    """精准暴力输入，规避 React 拦截"""
     try:
         time.sleep(2) 
         page.screenshot(path=f"data/debug_{label}_before_input.png")
         
-        # 🚨 直接通过 JS 精准定位最新版 Grok 的 ProseMirror 输入框，执行底层输入
         injected = page.evaluate("""(text) => {
             const el = document.querySelector('.ProseMirror[contenteditable="true"]');
             if (el) {
                 el.focus();
-                // 模拟粘贴行为，绕过拦截
                 document.execCommand('insertText', false, text);
                 return true;
             }
@@ -265,8 +219,6 @@ def send_prompt(page, prompt_text, label):
              for _ in range(3):
                  page.keyboard.press("Tab")
                  time.sleep(0.1)
-             
-             # 盲粘贴
              page.evaluate("""(text) => {
                  const ta = document.createElement('textarea');
                  ta.id = 'hacker_clipboard'; ta.value = text;
@@ -283,7 +235,6 @@ def send_prompt(page, prompt_text, label):
         page.keyboard.press("Enter")
         time.sleep(1)
         
-        # 强制点击发送按钮兜底
         page.evaluate("""() => { 
             const btns = Array.from(document.querySelectorAll('button'));
             const sendBtn = btns.find(b => {
@@ -296,8 +247,6 @@ def send_prompt(page, prompt_text, label):
         print(f"[{label}] OK Prompt Sent", flush=True)
     except Exception as e:
         print(f"[{label}] WARNING Prompt issue: {e}", flush=True)
-        try: page.screenshot(path=f"data/debug_{label}_exception.png")
-        except: pass
     time.sleep(5)
 
 def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, extend_if_growing=False, min_len=80):
@@ -306,11 +255,11 @@ def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, ext
         time.sleep(interval)
         elapsed += interval
         try: 
-            # 🚨 升级提取器：只提取明确带有 markdown 或 prose 类的元素，彻底过滤掉用户自己的 Prompt 对话气泡
             text = page.evaluate("""() => { 
                 const msgs = Array.from(document.querySelectorAll('.prose, .markdown, [data-testid="assistant-message"]'));
-                if (msgs.length === 0) return "";
-                return msgs[msgs.length - 1].innerText; 
+                const ai_msgs = msgs.filter(m => !m.innerText.includes('You are an X/Twitter data collection tool'));
+                if (ai_msgs.length === 0) return "";
+                return ai_msgs[ai_msgs.length - 1].innerText; 
             }""")
         except: 
             return last_text.strip()
@@ -318,7 +267,6 @@ def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, ext
         last_text = text
         cur_len = len(text.strip())
         
-        # 确认是不是 JSON 格式，开始稳定计数
         if cur_len == last_len and cur_len >= min_len and "{" in text and "}" in text:
             stable += 1
             if stable >= stable_rounds: return text.strip()
@@ -384,28 +332,67 @@ def build_phase2_a_prompt(accounts: list) -> str:
         '  Quote:  {"a":"Name","l":likes,"t":"MMDD","s":"summary","qt":"@orig: summary","tag":"raw"}\n'
     )
 
-def run_grok_batch(context, accounts: list, prompt_builder, label: str) -> list:
+def run_grok_batch_with_relay(browser, cookie_configs, accounts: list, prompt_builder, label: str):
+    """🚨 核心接力引擎：如果当前账号被限流，自动切换下一个账号！"""
     if not accounts: return []
-    page = open_grok_page(context)
-    if not page: return []
-    try:
-        prompt = prompt_builder(accounts)
-        send_prompt(page, prompt, label)
-        print(f"[{label}] Waiting 60s for Grok to start searching...", flush=True)
-        time.sleep(60)
-        raw_text = wait_and_extract(page, label, interval=5, stable_rounds=5, max_wait=420, extend_if_growing=True, min_len=50)
-        results = parse_jsonlines(raw_text)
+    
+    global _current_cookie_idx
+    attempts = 0
+    max_attempts = len(cookie_configs)
+    
+    while attempts < max_attempts:
+        cfg = cookie_configs[_current_cookie_idx]
+        env_key = cfg["env_key"]
         
-        if len(results) == 0:
-            print(f"\n[{label}] ⚠️ 警告：解析到 0 条 JSON！Grok 的原始回复是：\n{raw_text[:800]}...\n", flush=True)
-        else:
-            print(f"[{label}] OK Parsed {len(results)} JSON objects", flush=True)
+        print(f"\n[{label}] 🟢 启动抓取 (使用账号: {env_key})...", flush=True)
+        context = create_browser_context(browser, cfg)
+        page = open_grok_page(context, env_key)
+        
+        if not page:
+            print(f"[{label}] ❌ 账号 {env_key} 登录失效，切换下一个...", flush=True)
+            context.close()
+            _current_cookie_idx = (_current_cookie_idx + 1) % len(cookie_configs)
+            attempts += 1
+            continue
             
-        return results
-    except Exception as e: print(f"[{label}] ERROR: {e}", flush=True); return []
-    finally:
-        try: page.close()
-        except: pass
+        try:
+            prompt = prompt_builder(accounts)
+            send_prompt(page, prompt, label)
+            
+            print(f"[{label}] 等待 60s 让 Grok 搜索...", flush=True)
+            time.sleep(60)
+            raw_text = wait_and_extract(page, label, interval=5, stable_rounds=5, max_wait=420, extend_if_growing=True, min_len=50)
+            results = parse_jsonlines(raw_text)
+            
+            if len(results) > 0:
+                print(f"[{label}] ✅ 成功抓取 {len(results)} 条数据！", flush=True)
+                save_and_renew_session(context, env_key)
+                page.close()
+                context.close()
+                return results
+            else:
+                print(f"[{label}] ⚠️ 账号 {env_key} 被限流或报错 (返回 0 条 JSON)。", flush=True)
+                print(f"[{label}] 🤖 Grok 的遗言: {raw_text[:300]}...", flush=True)
+                
+                # 保存一下被限流的账号状态，然后关闭
+                save_and_renew_session(context, env_key)
+                page.close()
+                context.close()
+                
+                # 切换下一个号
+                _current_cookie_idx = (_current_cookie_idx + 1) % len(cookie_configs)
+                attempts += 1
+                print(f"[{label}] 🔄 正在无缝切换到备用账号...", flush=True)
+                
+        except Exception as e:
+            print(f"[{label}] 💥 运行崩溃: {e}", flush=True)
+            try: page.close(); context.close()
+            except: pass
+            _current_cookie_idx = (_current_cookie_idx + 1) % len(cookie_configs)
+            attempts += 1
+
+    print(f"[{label}] 💀 灾难：所有配置的 Grok 账号均已耗尽或被限流！", flush=True)
+    return []
 
 def classify_accounts(meta_results: dict) -> dict:
     tz = timezone(timedelta(hours=8))
@@ -722,50 +709,41 @@ def save_daily_data(today_str: str, post_objects: list, report_text: str):
     (data_dir / "combined.txt").write_text(combined_txt, encoding="utf-8")
     if report_text: (data_dir / "daily_report.txt").write_text(report_text, encoding="utf-8")
 
+
+# 🚨 全局记录当前使用的 Cookie 序号
+_current_cookie_idx = 0
+
 # ==============================================================================
 # 🚀 主程序入口
 # ==============================================================================
 def main():
+    global _current_cookie_idx
     print("=" * 60, flush=True)
     mode_str = "测试模式(1个Batch-6人)" if TEST_MODE else "全量模式"
-    print(f"昨晚硅谷在聊啥 v8.4 (专家模式直驱版 - {mode_str})", flush=True)
+    print(f"昨晚硅谷在聊啥 v8.5 (无限接力版 + 专家模式直驱 + xAI提纯 - {mode_str})", flush=True)
     print("=" * 60, flush=True)
 
     today_str, _ = get_dates()
     Path("data").mkdir(exist_ok=True)
-    
     check_cookie_expiry()
     
-    # 🚨 测试模式下：只抽前 6 个人（2轮并发），保证绝对不会触发上下文溢出！
+    # 🚨 1. 装载所有的 Cookie 配置 (支持 SUPER_GROK_COOKIES 到 SUPER_GROK_COOKIES_5)
+    cookie_configs = get_available_cookies()
+    if not cookie_configs:
+        print("💥 致命错误：未找到任何 SUPER_GROK_COOKIES 环境变量！", flush=True)
+        return
+    print(f"🔑 成功装载 {len(cookie_configs)} 个 Grok 账号，准备开启无限接力抓取！", flush=True)
+
     selected_accounts = ALL_ACCOUNTS[:6] if TEST_MODE else ALL_ACCOUNTS
     meta_results, phase1_posts, phase2_posts = {}, {}, {}
-    
-    is_storage_state = prepare_session_file()
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-blink-features=AutomationControlled", "--window-size=1280,800"]
         )
-        ctx_opts = {"viewport": {"width": 1280, "height": 800}, "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "locale": "zh-CN"}
-        if is_storage_state: ctx_opts["storage_state"] = "session_state.json"
-        
-        context = browser.new_context(**ctx_opts)
-        if not is_storage_state: load_raw_cookies(context)
-
-        # 验证登录
-        verify_page = context.new_page()
-        verify_page.goto("https://grok.com", wait_until="domcontentloaded", timeout=60000)
-        time.sleep(5)
-        if _is_login_page(verify_page.url):
-            print("ERROR: Not logged in - session expired", flush=True)
-            verify_page.screenshot(path="data/debug_login_failed.png")
-            browser.close()
-            return
-        verify_page.close()
 
         # --- Phase 1: 扫描 ---
-        # 🚨 降载保命：每次只派发 20 人给 Grok，防止超载回复 0 结果
         BATCH_SIZE = 20
         for batch_num, batch_start in enumerate(range(0, len(selected_accounts), BATCH_SIZE), start=1):
             if TEST_MODE and batch_num > 1: break
@@ -773,7 +751,9 @@ def main():
             
             batch = selected_accounts[batch_start:batch_start + BATCH_SIZE]
             label = f"Phase1-Batch{batch_num}"
-            results = run_grok_batch(context, batch, build_phase1_prompt, label)
+            
+            # 🚨 核心逻辑：利用多个账号轮流尝试，直到成功或全部耗尽
+            results = run_grok_batch_with_relay(browser, cookie_configs, batch, build_phase1_prompt, label)
             
             for obj in results:
                 account = obj.get("a", "").lstrip("@")
@@ -781,24 +761,22 @@ def main():
                 if obj.get("type") == "meta": meta_results[account] = obj
                 else: phase1_posts.setdefault(account, []).append(obj)
 
-        # 分层
         classification = classify_accounts(meta_results)
         s_accounts = [a for a, t in classification.items() if t == "S"]
         a_accounts = [a for a, t in classification.items() if t == "A"]
         
         # --- Phase 2: S 级深挖 ---
         if s_accounts and time.time() - _START_TIME < GLOBAL_DEADLINE:
-            s_results = run_grok_batch(context, s_accounts, build_phase2_s_prompt, label="Phase2-S")
+            s_results = run_grok_batch_with_relay(browser, cookie_configs, s_accounts, build_phase2_s_prompt, "Phase2-S")
             for obj in s_results:
                 if obj.get("type") != "meta": phase2_posts.setdefault(obj.get("a", "").lstrip("@"), []).append(obj)
 
-        # --- Phase 2: A 级深挖
+        # --- Phase 2: A 级深挖 ---
         if a_accounts and time.time() - _START_TIME < GLOBAL_DEADLINE:
-            a_results = run_grok_batch(context, a_accounts, build_phase2_a_prompt, label="Phase2-A")
+            a_results = run_grok_batch_with_relay(browser, cookie_configs, a_accounts, build_phase2_a_prompt, "Phase2-A")
             for obj in a_results:
                 if obj.get("type") != "meta": phase2_posts.setdefault(obj.get("a", "").lstrip("@"), []).append(obj)
 
-        save_and_renew_session(context)
         browser.close()
 
     # 组装 JSONL 喂给 xAI SDK
@@ -831,7 +809,7 @@ def main():
                 
             save_daily_data(today_str, all_posts_flat, xml_result)
             
-            print("\n🎉 V8.4 运行完毕！", flush=True)
+            print("\n🎉 V8.5 运行完毕！", flush=True)
         else:
             print("❌ LLM 处理失败，任务终止。")
 
