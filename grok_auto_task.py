@@ -128,28 +128,43 @@ def save_and_renew_session(context):
         with open("session_state.json", "r", encoding="utf-8") as f:
             state_str = f.read()
 
-        # 🚨 修复 422 报错：必须加上 X-GitHub-Api-Version
+        # 🚨 确保 GITHUB_REPOSITORY 没有多余的空格或斜杠
+        repo_name = GITHUB_REPOSITORY.strip().strip("/")
+        
         headers = {
-            "Authorization": f"Bearer {PAT_FOR_SECRETS}", 
+            "Authorization": f"Bearer {PAT_FOR_SECRETS.strip()}", 
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28"
         }
-        key_resp = requests.get(f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/secrets/public-key", headers=headers, timeout=30)
-        key_resp.raise_for_status()
+        
+        # 1. 获取公钥
+        key_url = f"https://api.github.com/repos/{repo_name}/actions/secrets/public-key"
+        key_resp = requests.get(key_url, headers=headers, timeout=30)
+        
+        if key_resp.status_code != 200:
+            print(f"[Session] WARNING: 无法获取公钥。状态码: {key_resp.status_code}. 请检查 PAT 是否有 'Secrets: Read and write' 权限，且仓库名 {repo_name} 是否正确。", flush=True)
+            return
+            
         key_data = key_resp.json()
 
+        # 2. 加密
         pub_key = nacl_public.PublicKey(key_data["key"].encode(), encoding.Base64Encoder())
         sealed  = nacl_public.SealedBox(pub_key).encrypt(state_str.encode())
         enc_b64 = base64.b64encode(sealed).decode()
 
-        put_resp = requests.put(
-            f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/secrets/SUPER_GROK_COOKIES",
-            headers=headers, json={"encrypted_value": enc_b64, "key_id": key_data["key_id"]}, timeout=30
-        )
+        # 3. 更新 Secret
+        put_url = f"https://api.github.com/repos/{repo_name}/actions/secrets/SUPER_GROK_COOKIES"
+        payload = {"encrypted_value": enc_b64, "key_id": key_data["key_id"]}
+        
+        put_resp = requests.put(put_url, headers=headers, json=payload, timeout=30)
+        
         if put_resp.status_code == 422:
-            print("[Session] WARNING: 422 错误。如果你用的是 Fine-Grained Token，请务必去 GitHub 给这个 Token 添加 'Secrets' 的 Read and Write 权限！", flush=True)
-        put_resp.raise_for_status()
-        print("[Session] OK GitHub Secret SUPER_GROK_COOKIES auto-renewed", flush=True)
+            print("[Session] ERROR: 422 错误！API 请求体无法处理。请绝对确认你的 Token 是 Fine-Grained Token，并且具备对该仓库的 'Secrets' 读写权限！", flush=True)
+        elif put_resp.status_code in [201, 204]:
+            print("[Session] OK GitHub Secret SUPER_GROK_COOKIES auto-renewed", flush=True)
+        else:
+            print(f"[Session] ERROR: 更新 Secret 失败，状态码: {put_resp.status_code}", flush=True)
+            
     except Exception as e:
         print(f"[Session] ERROR Secret renewal failed: {e}", flush=True)
 
@@ -196,7 +211,7 @@ def open_grok_page(context):
     page = context.new_page()
     try:
         page.goto("https://grok.com", wait_until="domcontentloaded", timeout=60000)
-        time.sleep(3)
+        time.sleep(5) # 给首页多点时间加载前端框架
         if _is_login_page(page.url):
             print("ERROR: Not logged in - session expired", flush=True)
             page.close()
@@ -210,74 +225,120 @@ def open_grok_page(context):
 
 def send_prompt(page, prompt_text, label):
     """
-    终极复合输入法：结合 DOM 强注、模拟输入与模拟点击，确保穿透任何前端防御。
+    V8.3 纯正硬件级模拟：放弃一切 JS 注入，完全使用键盘交互！
     """
     try:
-        # 第一层攻击：寻找所有的潜在输入容器
-        # 很多现代框架的输入框可能是个 div(contenteditable)
-        page.wait_for_selector("textarea, div[contenteditable='true']", timeout=30000)
+        time.sleep(3) # 等待页面完全稳定
         
-        # 使用 JS 强行将内容填入可能的输入框，并触发 Input 事件
-        ok = page.evaluate("""(text) => { 
-            const el = document.querySelector("div[contenteditable='true']") || document.querySelector("textarea:not([hidden])") || document.querySelector("textarea"); 
-            if (!el) return false; 
-            el.focus(); 
-            // 如果是普通的 textarea
-            if (el.tagName.toLowerCase() === 'textarea') {
-                el.value = text;
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-            } else {
-                // 如果是 div
-                document.execCommand('selectAll', false, null); 
-                document.execCommand('delete', false, null); 
-                document.execCommand('insertText', false, text); 
-            }
-            return true; 
+        # 1. 尝试找到页面上的输入框，使用 Playwright 原生的 fill
+        # 我们寻找各种可能作为输入框的元素，并优先点击它以获取焦点
+        input_locator = page.locator("textarea, .ProseMirror, div[contenteditable='true']").last
+        
+        try:
+            # 尝试点击它
+            input_locator.click(timeout=5000)
+            time.sleep(0.5)
+        except:
+            # 如果点不到，盲按几下 Tab 试试运气
+            for _ in range(3):
+                page.keyboard.press("Tab")
+                time.sleep(0.1)
+                
+        # 2. 清空可能存在的内容
+        page.keyboard.press("Control+a")
+        page.keyboard.press("Backspace")
+        time.sleep(0.5)
+        
+        # 3. 🚨 暴力打字机：利用剪贴板机制（规避 JS 注入拦截）
+        # 将长文本放入页面的一个隐藏元素中，然后用 JS 选中它，执行复制，再通过键盘执行粘贴。
+        page.evaluate("""(text) => {
+            const ta = document.createElement('textarea');
+            ta.id = 'hacker_clipboard';
+            ta.value = text;
+            ta.style.position = 'absolute';
+            ta.style.top = '-9999px';
+            document.body.appendChild(ta);
         }""", prompt_text)
         
+        # 让隐藏的 textarea 获取焦点并全选
+        page.evaluate("""() => {
+            const ta = document.getElementById('hacker_clipboard');
+            ta.select();
+        }""")
+        
+        # 执行系统级复制
+        page.keyboard.press("Control+c")
+        time.sleep(0.5)
+        
+        # 焦点切回刚才尝试获取的真实输入框
+        try:
+            input_locator.click()
+        except:
+            pass # 如果点不到就顺其自然，希望焦点是对的
+            
+        # 执行系统级粘贴
+        page.keyboard.press("Control+v")
         time.sleep(1)
         
-        # 第二层攻击：模拟真实的键盘输入作为兜底（敲一个空格触发状态更新，然后再删掉）
-        page.keyboard.press("Space")
-        time.sleep(0.1)
-        page.keyboard.press("Backspace")
-        time.sleep(1)
+        # 兜底：如果剪贴板策略失败，用真实的打字 API 强行输入（为了速度，只在失败时用）
+        # 我们检查一下输入框里有没有东西
+        has_content = page.evaluate("""() => {
+            const el = document.activeElement;
+            if (!el) return false;
+            return el.value?.length > 0 || el.textContent?.length > 0;
+        }""")
         
-        # 第三层攻击：模拟回车发送
+        if not has_content:
+             print(f"[{label}] 剪贴板失效，启用逐字硬敲模式...", flush=True)
+             page.keyboard.type(prompt_text, delay=0.5) # 极快打字
+             time.sleep(1)
+             
+        # 清理垃圾
+        page.evaluate("""() => {
+            const ta = document.getElementById('hacker_clipboard');
+            if(ta) ta.remove();
+        }""")
+
+        # 4. 发送！
         page.keyboard.press("Enter")
         time.sleep(1)
         
-        # 第四层攻击：强行寻找并点击发送按钮
-        page.evaluate("""() => { 
-            const btn = document.querySelector("button[aria-label='Submit'], button[aria-label*='Send'], button[type='submit'], button[aria-label='Grok something']"); 
-            if (btn && !btn.disabled) btn.click(); 
-        }""")
-        
-        print(f"[{label}] OK Prompt Sent (Composite Attack)", flush=True)
+        # 发送按钮双保险
+        try:
+             # 尝试寻找提交按钮并强制点击
+             send_btn = page.locator("button[type='submit'], button[aria-label*='Send'], button[aria-label*='Submit']").last
+             send_btn.click(timeout=3000, force=True)
+        except:
+             pass
+             
+        print(f"[{label}] OK Prompt Sent (Hardware Sim)", flush=True)
     except Exception as e:
         print(f"[{label}] WARNING Prompt issue: {e}", flush=True)
-    time.sleep(5)
+    time.sleep(8) # 多等一会儿，让它飞一会
 
 def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, extend_if_growing=False, min_len=80):
     last_len, stable, elapsed, last_text = -1, 0, 0, ""
     while elapsed < max_wait:
         time.sleep(interval)
         elapsed += interval
-        try: text = page.evaluate("""() => { 
-            const msgs = Array.from(document.querySelectorAll('.message, [data-testid="message"], .message-bubble, .response-content'));
-            if (msgs.length === 0) return "";
-            return msgs[msgs.length - 1].innerText; 
-        }""")
-        except: return last_text.strip()
-        
-        # 🚨 屏蔽提取自身的 Prompt：如果抓到的是我们自己发的话，说明 Grok 还没开始生成，继续等！
-        if text and "You are an X/Twitter data collection tool" in text:
-            continue
+        try: 
+            text = page.evaluate("""() => { 
+                // 排除用户自己发送的 prompt，只抓取 AI 返回的块
+                const msgs = Array.from(document.querySelectorAll('.message, [data-testid="message"], .message-bubble, .response-content, .ProseMirror-widget'));
+                // 过滤掉包含我们特征词的块
+                const ai_msgs = msgs.filter(m => !m.innerText.includes('You are an X/Twitter data collection tool'));
+                
+                if (ai_msgs.length === 0) return "";
+                return ai_msgs[ai_msgs.length - 1].innerText; 
+            }""")
+        except: 
+            return last_text.strip()
             
         last_text = text
         cur_len = len(text.strip())
-        if cur_len == last_len and cur_len >= min_len:
+        
+        # 只有抓到有效的 JSON 行格式，才认为开始稳定
+        if cur_len == last_len and cur_len >= min_len and "{" in text and "}" in text:
             stable += 1
             if stable >= stable_rounds: return text.strip()
         else:
