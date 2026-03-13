@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-grok_auto_task.py  v8.2 (带“行车记录仪”的截图调试版)
+grok_auto_task.py  v8.4 (专家模式直驱版 + 精准 ProseMirror 适配)
 Architecture: Playwright(Grok Web) -> JSONL -> xAI SDK (XML Prompt) -> Feishu/WeChat UI
 """
 
@@ -139,7 +139,7 @@ def save_and_renew_session(context):
         key_resp = requests.get(key_url, headers=headers, timeout=30)
         
         if key_resp.status_code != 200:
-            print(f"[Session] WARNING: 无法获取公钥。状态码: {key_resp.status_code}. 请检查 PAT 是否有 'repo' 权限，且仓库名 {repo_name} 是否正确。", flush=True)
+            print(f"[Session] WARNING: 无法获取公钥。状态码: {key_resp.status_code}. 请检查 PAT 权限及仓库名 {repo_name}。", flush=True)
             return
             
         key_data = key_resp.json()
@@ -153,7 +153,7 @@ def save_and_renew_session(context):
         put_resp = requests.put(put_url, headers=headers, json=payload, timeout=30)
         
         if put_resp.status_code == 422:
-            print("[Session] ERROR: 422 错误！API 请求体无法处理。如果你用了 Fine-Grained，请换回 Classic Token，并勾选 repo 权限！", flush=True)
+            print("[Session] ERROR: 422 错误！强烈建议你去 GitHub 删除旧的 PAT，重新生成一个【Classic Token】，并只勾选 `repo` 权限！", flush=True)
         elif put_resp.status_code in [201, 204]:
             print("[Session] OK GitHub Secret SUPER_GROK_COOKIES auto-renewed", flush=True)
         else:
@@ -177,25 +177,41 @@ def check_cookie_expiry():
                     print(f"[Cookie] Warning: Grok Cookie '{cname}' expires in {days_left} days", flush=True)
     except: pass
 
-def enable_grok4_beta(page):
-    print("\n[Model] Trying to enable Beta Toggle...", flush=True)
-    selectors = ["button:has-text('Fast')", "button:has-text('Auto')", "button:has-text('Grok')", "button[aria-label*='model' i]", "button[data-testid*='model' i]"]
-    model_btn = None
-    for sel in selectors:
-        try:
-            model_btn = page.wait_for_selector(sel, timeout=4000)
-            if model_btn: break
-        except: continue
-    if not model_btn: return
+def select_expert_mode(page):
+    """根据截图适配：自动寻找并切换到【专家模式】"""
+    print("\n[Model] Switching to Expert Mode (专家模式)...", flush=True)
     try:
-        model_btn.click()
+        # 1. 找到当前的模型选择按钮（自动模式/快速模式）并点击
+        page.evaluate("""() => {
+            const btns = Array.from(document.querySelectorAll('button'));
+            const modelBtn = btns.find(b => 
+                b.innerText && (
+                    b.innerText.includes('自动模式') || b.innerText.includes('Auto') || 
+                    b.innerText.includes('快速模式') || b.innerText.includes('Fast') || 
+                    b.innerText.includes('专家模式') || b.innerText.includes('Expert')
+                )
+            );
+            if (modelBtn) modelBtn.click();
+        }""")
         time.sleep(1)
-        toggle = page.wait_for_selector("button[role='switch'], input[type='checkbox']", timeout=6000)
-        is_on = page.evaluate("""() => { const sw = document.querySelector("button[role='switch']"); if (sw) return sw.getAttribute('aria-checked') === 'true' || sw.getAttribute('data-state') === 'checked'; const cb = document.querySelector("input[type='checkbox']"); return cb ? cb.checked : false; }""")
-        if not is_on: toggle.click()
-        page.keyboard.press("Escape")
+        
+        # 2. 在弹出的菜单中，点击【专家模式】
+        page.evaluate("""() => {
+            const opts = Array.from(document.querySelectorAll('div, button, [role="menuitem"], [role="option"]'));
+            const expertOpt = opts.find(o => 
+                o.innerText && (
+                    o.innerText.includes('专家模式') || 
+                    o.innerText.includes('Expert') || 
+                    o.innerText.includes('Thinks hard')
+                )
+            );
+            if (expertOpt) expertOpt.click();
+        }""")
         time.sleep(0.5)
-    except Exception as e: pass
+        page.keyboard.press("Escape") # 关闭可能的残留弹窗
+        print("[Model] OK Expert Mode selected", flush=True)
+    except Exception as e:
+        print(f"[Model] Warning: Failed to select Expert mode: {e}", flush=True)
 
 def _is_login_page(url: str) -> bool:
     lower = url.lower()
@@ -207,17 +223,16 @@ def open_grok_page(context):
         page.goto("https://grok.com", wait_until="domcontentloaded", timeout=60000)
         time.sleep(5) 
         
-        # 🚨 第一张截图：首页加载后
         Path("data").mkdir(exist_ok=True)
         page.screenshot(path="data/debug_01_grok_homepage.png")
-        print("[Debug] Homepage screenshot saved to data/debug_01_grok_homepage.png", flush=True)
         
         if _is_login_page(page.url):
             print("ERROR: Not logged in - session expired", flush=True)
             page.screenshot(path="data/debug_02_login_failed.png")
             page.close()
             return None
-        enable_grok4_beta(page)
+            
+        select_expert_mode(page) # 🚨 切换为专家模式
         return page
     except Exception as e:
         print(f"[Debug] open_grok_page error: {e}", flush=True)
@@ -227,106 +242,63 @@ def open_grok_page(context):
 
 def send_prompt(page, prompt_text, label):
     """
-    改进的输入策略与拦截兜底
+    精准打击 ProseMirror 富文本框，彻底消灭 Timeout。
     """
     try:
-        time.sleep(3) 
-        
-        # 🚨 第二张截图：输入前的状态
+        time.sleep(2) 
         page.screenshot(path=f"data/debug_{label}_before_input.png")
         
-        # 寻找广泛的输入框元素
-        selectors = [
-            "div.ProseMirror[contenteditable='true']",
-            "div[data-placeholder*='Message'][contenteditable='true']",
-            "textarea:not([hidden]):not([aria-hidden='true'])"
-        ]
-        
-        input_locator = None
-        for selector in selectors:
-            try:
-                locator = page.locator(selector).first
-                locator.wait_for(state="visible", timeout=3000)
-                input_locator = locator
-                print(f"[{label}] Found input field with selector: {selector}", flush=True)
-                break
-            except Exception:
-                continue
-
-        if input_locator:
-            try:
-                input_locator.click()
-                time.sleep(0.5)
-            except Exception as click_err:
-                 print(f"[{label}] Could not click input field: {click_err}", flush=True)
-        else:
-            print(f"[{label}] WARNING: Could not find visible input field.", flush=True)
-            for _ in range(3):
-                page.keyboard.press("Tab")
-                time.sleep(0.2)
-                
-        page.keyboard.press("Control+a")
-        page.keyboard.press("Backspace")
-        time.sleep(0.5)
-        
-        # 暴力打字机：剪贴板挂载
-        page.evaluate("""(text) => {
-            const ta = document.createElement('textarea');
-            ta.id = 'hacker_clipboard';
-            ta.value = text;
-            ta.style.position = 'absolute';
-            ta.style.top = '-9999px';
-            document.body.appendChild(ta);
+        # 🚨 直接通过 JS 精准定位最新版 Grok 的 ProseMirror 输入框，执行底层输入
+        injected = page.evaluate("""(text) => {
+            const el = document.querySelector('.ProseMirror[contenteditable="true"]');
+            if (el) {
+                el.focus();
+                // 模拟粘贴行为，绕过拦截
+                document.execCommand('insertText', false, text);
+                return true;
+            }
+            return false;
         }""", prompt_text)
         
-        page.evaluate("""() => {
-            const ta = document.getElementById('hacker_clipboard');
-            ta.select();
-        }""")
-        
-        page.keyboard.press("Control+c")
-        time.sleep(0.5)
-        
-        if input_locator:
-            try: input_locator.click()
-            except: pass
-            
-        page.keyboard.press("Control+v")
-        time.sleep(1)
-        
-        has_content = page.evaluate("""() => {
-            const el = document.activeElement;
-            if (!el) return false;
-            return el.value?.length > 0 || el.textContent?.length > 0;
-        }""")
-        
-        if not has_content:
-             print(f"[{label}] 剪贴板失效，启用逐字硬敲模式...", flush=True)
-             page.screenshot(path=f"data/debug_{label}_clipboard_failed.png")
-             page.keyboard.type(prompt_text, delay=0.01)
-             time.sleep(1)
+        if not injected:
+             print(f"[{label}] Warning: ProseMirror not found, trying blind clipboard paste...", flush=True)
+             for _ in range(3):
+                 page.keyboard.press("Tab")
+                 time.sleep(0.1)
              
-        page.evaluate("""() => {
-            const ta = document.getElementById('hacker_clipboard');
-            if(ta) ta.remove();
-        }""")
+             # 盲粘贴
+             page.evaluate("""(text) => {
+                 const ta = document.createElement('textarea');
+                 ta.id = 'hacker_clipboard'; ta.value = text;
+                 ta.style.position = 'absolute'; ta.style.top = '-9999px';
+                 document.body.appendChild(ta);
+                 ta.select();
+             }""", prompt_text)
+             page.keyboard.press("Control+c")
+             time.sleep(0.5)
+             page.keyboard.press("Control+v")
+             time.sleep(1)
+             page.evaluate("() => { const ta = document.getElementById('hacker_clipboard'); if(ta) ta.remove(); }")
 
         page.keyboard.press("Enter")
         time.sleep(1)
         
-        try:
-             send_btn = page.locator("button[type='submit'], button[aria-label*='Send'], button[aria-label*='Submit']").last
-             send_btn.click(timeout=2000, force=True)
-        except:
-             pass
+        # 强制点击发送按钮兜底
+        page.evaluate("""() => { 
+            const btns = Array.from(document.querySelectorAll('button'));
+            const sendBtn = btns.find(b => {
+                const aria = b.getAttribute('aria-label');
+                return aria && (aria.includes('Send') || aria.includes('Submit') || aria.includes('Grok'));
+            });
+            if (sendBtn && !sendBtn.disabled) sendBtn.click();
+        }""")
              
         print(f"[{label}] OK Prompt Sent", flush=True)
     except Exception as e:
         print(f"[{label}] WARNING Prompt issue: {e}", flush=True)
-        # 🚨 第三张截图：报错时的界面
         try: page.screenshot(path=f"data/debug_{label}_exception.png")
         except: pass
-    time.sleep(8)
+    time.sleep(5)
 
 def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, extend_if_growing=False, min_len=80):
     last_len, stable, elapsed, last_text = -1, 0, 0, ""
@@ -334,11 +306,11 @@ def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, ext
         time.sleep(interval)
         elapsed += interval
         try: 
+            # 🚨 升级提取器：只提取明确带有 markdown 或 prose 类的元素，彻底过滤掉用户自己的 Prompt 对话气泡
             text = page.evaluate("""() => { 
-                const msgs = Array.from(document.querySelectorAll('.message, [data-testid="message"], .message-bubble, .response-content, .ProseMirror-widget'));
-                const ai_msgs = msgs.filter(m => !m.innerText.includes('You are an X/Twitter data collection tool'));
-                if (ai_msgs.length === 0) return "";
-                return ai_msgs[ai_msgs.length - 1].innerText; 
+                const msgs = Array.from(document.querySelectorAll('.prose, .markdown, [data-testid="assistant-message"]'));
+                if (msgs.length === 0) return "";
+                return msgs[msgs.length - 1].innerText; 
             }""")
         except: 
             return last_text.strip()
@@ -346,6 +318,7 @@ def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, ext
         last_text = text
         cur_len = len(text.strip())
         
+        # 确认是不是 JSON 格式，开始稳定计数
         if cur_len == last_len and cur_len >= min_len and "{" in text and "}" in text:
             stable += 1
             if stable >= stable_rounds: return text.strip()
@@ -353,7 +326,6 @@ def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, ext
             stable = 0
             last_len = cur_len
             
-    # 如果超时了，截取一张最后状态的图
     page.screenshot(path=f"data/debug_{label}_timeout.png")
     return last_text.strip()
 
@@ -756,7 +728,7 @@ def save_daily_data(today_str: str, post_objects: list, report_text: str):
 def main():
     print("=" * 60, flush=True)
     mode_str = "测试模式(1个Batch-6人)" if TEST_MODE else "全量模式"
-    print(f"昨晚硅谷在聊啥 v8.2 (硅谷100人 Grok网页抓取 + xAI提纯 - {mode_str})", flush=True)
+    print(f"昨晚硅谷在聊啥 v8.4 (专家模式直驱版 - {mode_str})", flush=True)
     print("=" * 60, flush=True)
 
     today_str, _ = get_dates()
@@ -820,7 +792,7 @@ def main():
             for obj in s_results:
                 if obj.get("type") != "meta": phase2_posts.setdefault(obj.get("a", "").lstrip("@"), []).append(obj)
 
-        # --- Phase 2: A 级深挖 (上次遗漏的函数已补全) ---
+        # --- Phase 2: A 级深挖
         if a_accounts and time.time() - _START_TIME < GLOBAL_DEADLINE:
             a_results = run_grok_batch(context, a_accounts, build_phase2_a_prompt, label="Phase2-A")
             for obj in a_results:
@@ -859,11 +831,9 @@ def main():
                 
             save_daily_data(today_str, all_posts_flat, xml_result)
             
-            print("\n🎉 V8.2 运行完毕！", flush=True)
+            print("\n🎉 V8.4 运行完毕！", flush=True)
         else:
             print("❌ LLM 处理失败，任务终止。")
-
-    # 注意：我们在这里把 data 目录打包上传了（YML 里配置了），里面有运行时的截图。
 
 if __name__ == "__main__":
     main()
