@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-grok_auto_task.py  v8.6 (硅谷100人：多号接力 + 专家模式 + xAI排版 + 修复校验Bug)
-Architecture: Playwright(Grok Web Multi-Account) -> JSONL -> xAI SDK -> Feishu/WeChat
+grok_auto_task.py  v8.7 (硅谷100人：反防爬自然语言伪装版 + 专家模式 + xAI)
+Architecture: Playwright(Grok Web NLP Masking) -> Regex Parsing -> xAI SDK -> Feishu
 """
 
 import os
@@ -31,12 +31,10 @@ GITHUB_REPOSITORY   = os.getenv("GITHUB_REPOSITORY", "")
 
 TEST_MODE = os.getenv("TEST_MODE_ENV", "false").lower() == "true"
 
-# -- 全局超时设置 ---------------------------------------------------
 _START_TIME      = time.time()
-PHASE1_DEADLINE  = 40 * 60   # 第一阶段最多 40 分钟
-GLOBAL_DEADLINE  = 85 * 60   # 全局最多 85 分钟
+PHASE1_DEADLINE  = 40 * 60   
+GLOBAL_DEADLINE  = 85 * 60   
 
-# -- 100 硅谷 AI 核心账号 --------------------------------------------------------------
 ALL_ACCOUNTS = [
     "elonmusk", "sama", "karpathy", "demishassabis", "darioamodei",
     "OpenAI", "AnthropicAI", "GoogleDeepMind", "xAI", "AIatMeta",
@@ -73,197 +71,74 @@ def get_dates() -> tuple:
     yesterday = today - timedelta(days=1)
     return today.strftime("%Y-%m-%d"), yesterday.strftime("%Y-%m-%d")
 
-# ==============================================================================
-# 🕸️ 网页版 Grok 自动化：多号接力与会话管理
-# ==============================================================================
 def get_available_cookies():
-    """获取所有配置的 Grok Cookie 账号"""
     configs = []
     keys = ["SUPER_GROK_COOKIES"] + [f"SUPER_GROK_COOKIES_{i}" for i in range(2, 6)]
     for key in keys:
         val = os.getenv(key, "").strip()
-        if val:
-            configs.append({"env_key": key, "value": val})
+        if val: configs.append({"env_key": key, "value": val})
     return configs
 
-# 🚨 补回了误删的 Cookie 过期检查函数，并升级为支持多号检查
-def check_cookie_expiry(cookie_configs):
-    for cfg in cookie_configs:
-        try:
-            data = json.loads(cfg["value"])
-            if not isinstance(data, list): continue
-            watched_names = {"sso", "auth_token", "ct0"}
-            for c in data:
-                cname = c.get("name", "")
-                if cname in watched_names and c.get("expirationDate"):
-                    exp = datetime.fromtimestamp(c["expirationDate"], tz=timezone.utc)
-                    days_left = (exp - datetime.now(timezone.utc)).days
-                    if days_left <= 5:
-                        print(f"[Cookie] Warning: 账号 {cfg['env_key']} 中的核心 Cookie '{cname}' 将在 {days_left} 天后过期！", flush=True)
-        except: pass
-
 def create_browser_context(browser, cookie_config):
-    """根据指定的 Cookie 创建独立的浏览器上下文"""
-    ctx = browser.new_context(
-        viewport={"width": 1280, "height": 800}, 
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", 
-        locale="zh-CN"
-    )
+    ctx = browser.new_context(viewport={"width": 1280, "height": 800}, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", locale="zh-CN")
     try:
         cookies = json.loads(cookie_config["value"])
-        formatted = []
-        for c in cookies:
-            cookie = {"name": c.get("name", ""), "value": c.get("value", ""), "domain": c.get("domain", ".grok.com"), "path": c.get("path", "/")}
-            if "httpOnly" in c: cookie["httpOnly"] = c["httpOnly"]
-            if "secure" in c: cookie["secure"] = c["secure"]
-            ss = c.get("sameSite", "")
-            if ss in ("Strict", "Lax", "None"): cookie["sameSite"] = ss
-            formatted.append(cookie)
+        formatted = [{"name": c.get("name", ""), "value": c.get("value", ""), "domain": c.get("domain", ".grok.com"), "path": c.get("path", "/")} for c in cookies]
         ctx.add_cookies(formatted)
-        print(f"[Session] OK Loaded account via {cookie_config['env_key']}", flush=True)
-    except Exception as e:
-        print(f"[Session] ERROR Cookie injection failed for {cookie_config['env_key']}: {e}", flush=True)
+        print(f"[Session] OK Loaded {cookie_config['env_key']}", flush=True)
+    except: pass
     return ctx
 
-def save_and_renew_session(context, env_key):
-    """自动将刷新后的 Cookie 存回指定的 GitHub Secret"""
-    if not PAT_FOR_SECRETS or not GITHUB_REPOSITORY:
-        return
-    try:
-        from nacl import encoding, public as nacl_public
-        
-        # 直接从 Playwright 提取最新 Cookie 并序列化为 JSON
-        cookies = context.cookies()
-        state_str = json.dumps(cookies)
-
-        repo_name = GITHUB_REPOSITORY.strip().strip("/")
-        headers = {
-            "Authorization": f"Bearer {PAT_FOR_SECRETS.strip()}", 
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28"
-        }
-        
-        key_url = f"https://api.github.com/repos/{repo_name}/actions/secrets/public-key"
-        key_resp = requests.get(key_url, headers=headers, timeout=30)
-        
-        if key_resp.status_code != 200:
-            print(f"[Session] WARNING: 无法获取公钥，无法续期 {env_key}。请检查 PAT 是否有 'repo' 权限。", flush=True)
-            return
-            
-        key_data = key_resp.json()
-        pub_key = nacl_public.PublicKey(key_data["key"].encode(), encoding.Base64Encoder())
-        sealed  = nacl_public.SealedBox(pub_key).encrypt(state_str.encode())
-        enc_b64 = base64.b64encode(sealed).decode()
-
-        put_url = f"https://api.github.com/repos/{repo_name}/actions/secrets/{env_key}"
-        payload = {"encrypted_value": enc_b64, "key_id": key_data["key_id"]}
-        
-        put_resp = requests.put(put_url, headers=headers, json=payload, timeout=30)
-        
-        if put_resp.status_code in [201, 204]:
-            print(f"[Session] OK GitHub Secret {env_key} auto-renewed", flush=True)
-        else:
-            print(f"[Session] ERROR: 更新 Secret 失败，状态码: {put_resp.status_code}", flush=True)
-            
-    except Exception as e:
-        print(f"[Session] ERROR Secret renewal failed: {e}", flush=True)
-
 def select_expert_mode(page):
-    """智能寻找并开启专家模式"""
-    print("\n[Model] Switching to Expert Mode (专家模式)...", flush=True)
+    print("\n[Model] Switching to Expert Mode...", flush=True)
     try:
-        page.evaluate("""() => {
-            const btns = Array.from(document.querySelectorAll('button'));
-            const modelBtn = btns.find(b => b.innerText && (b.innerText.includes('自动模式') || b.innerText.includes('Auto') || b.innerText.includes('快速模式') || b.innerText.includes('Fast') || b.innerText.includes('专家模式') || b.innerText.includes('Expert')));
-            if (modelBtn) modelBtn.click();
-        }""")
+        page.evaluate("() => { const btns = Array.from(document.querySelectorAll('button')); const modelBtn = btns.find(b => b.innerText && (b.innerText.includes('Auto') || b.innerText.includes('Fast') || b.innerText.includes('Expert') || b.innerText.includes('模式'))); if (modelBtn) modelBtn.click(); }")
         time.sleep(1)
-        page.evaluate("""() => {
-            const opts = Array.from(document.querySelectorAll('div, button, [role="menuitem"], [role="option"]'));
-            const expertOpt = opts.find(o => o.innerText && (o.innerText.includes('专家模式') || o.innerText.includes('Expert') || o.innerText.includes('Thinks hard')));
-            if (expertOpt) expertOpt.click();
-        }""")
+        page.evaluate("() => { const opts = Array.from(document.querySelectorAll('div, button, [role=\"menuitem\"]')); const expertOpt = opts.find(o => o.innerText && (o.innerText.includes('Expert') || o.innerText.includes('专家') || o.innerText.includes('Thinks hard'))); if (expertOpt) expertOpt.click(); }")
         time.sleep(0.5)
         page.keyboard.press("Escape")
-        print("[Model] OK Expert Mode selected", flush=True)
-    except Exception as e:
-        print(f"[Model] Warning: Failed to select Expert mode: {e}", flush=True)
+    except: pass
 
 def _is_login_page(url: str) -> bool:
-    lower = url.lower()
-    return any(kw in lower for kw in ("sign", "login", "oauth", "x.com/i/flow"))
+    return any(kw in url.lower() for kw in ("sign", "login", "oauth", "x.com/i/flow"))
 
 def open_grok_page(context, env_key):
     page = context.new_page()
     try:
         page.goto("https://grok.com", wait_until="domcontentloaded", timeout=60000)
         time.sleep(5) 
-        
-        Path("data").mkdir(exist_ok=True)
-        page.screenshot(path=f"data/debug_01_homepage_{env_key}.png")
-        
-        if _is_login_page(page.url):
-            print(f"ERROR: Account {env_key} is NOT logged in (Cookie expired).", flush=True)
-            page.close()
-            return None
-            
+        if _is_login_page(page.url): return None
         select_expert_mode(page)
         return page
-    except Exception as e:
-        try: page.close()
-        except: pass
-        return None
+    except: return None
 
 def send_prompt(page, prompt_text, label):
-    """精准暴力输入，规避 React 拦截"""
+    """最底层的盲切剪贴板，绝对穿透"""
     try:
         time.sleep(2) 
-        page.screenshot(path=f"data/debug_{label}_before_input.png")
-        
-        injected = page.evaluate("""(text) => {
-            const el = document.querySelector('.ProseMirror[contenteditable="true"]');
-            if (el) {
-                el.focus();
-                document.execCommand('insertText', false, text);
-                return true;
-            }
-            return false;
+        page.evaluate("""(text) => {
+            const ta = document.createElement('textarea');
+            ta.id = 'hacker_clipboard'; ta.value = text;
+            ta.style.position = 'absolute'; ta.style.top = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
         }""", prompt_text)
+        page.keyboard.press("Control+c")
+        time.sleep(0.5)
         
-        if not injected:
-             print(f"[{label}] Warning: ProseMirror not found, trying blind clipboard paste...", flush=True)
-             for _ in range(3):
-                 page.keyboard.press("Tab")
-                 time.sleep(0.1)
-             page.evaluate("""(text) => {
-                 const ta = document.createElement('textarea');
-                 ta.id = 'hacker_clipboard'; ta.value = text;
-                 ta.style.position = 'absolute'; ta.style.top = '-9999px';
-                 document.body.appendChild(ta);
-                 ta.select();
-             }""", prompt_text)
-             page.keyboard.press("Control+c")
-             time.sleep(0.5)
-             page.keyboard.press("Control+v")
-             time.sleep(1)
-             page.evaluate("() => { const ta = document.getElementById('hacker_clipboard'); if(ta) ta.remove(); }")
-
+        # 寻找光标点
+        page.evaluate("""() => {
+            const el = document.querySelector('.ProseMirror') || document.querySelector("textarea") || document.querySelector("div[contenteditable='true']");
+            if(el) el.focus();
+        }""")
+        
+        page.keyboard.press("Control+v")
+        time.sleep(1)
+        page.evaluate("() => { const ta = document.getElementById('hacker_clipboard'); if(ta) ta.remove(); }")
         page.keyboard.press("Enter")
         time.sleep(1)
-        
-        page.evaluate("""() => { 
-            const btns = Array.from(document.querySelectorAll('button'));
-            const sendBtn = btns.find(b => {
-                const aria = b.getAttribute('aria-label');
-                return aria && (aria.includes('Send') || aria.includes('Submit') || aria.includes('Grok'));
-            });
-            if (sendBtn && !sendBtn.disabled) sendBtn.click();
-        }""")
-             
-        print(f"[{label}] OK Prompt Sent", flush=True)
-    except Exception as e:
-        print(f"[{label}] WARNING Prompt issue: {e}", flush=True)
-    time.sleep(5)
+        page.evaluate("() => { const btns = Array.from(document.querySelectorAll('button')); const sendBtn = btns.find(b => b.getAttribute('aria-label') && b.getAttribute('aria-label').includes('Send')); if (sendBtn) sendBtn.click(); }")
+    except: pass
 
 def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, extend_if_growing=False, min_len=80):
     last_len, stable, elapsed, last_text = -1, 0, 0, ""
@@ -273,85 +148,88 @@ def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, ext
         try: 
             text = page.evaluate("""() => { 
                 const msgs = Array.from(document.querySelectorAll('.prose, .markdown, [data-testid="assistant-message"]'));
-                const ai_msgs = msgs.filter(m => !m.innerText.includes('You are an X/Twitter data collection tool'));
+                const ai_msgs = msgs.filter(m => !m.innerText.includes('Please help me organize'));
                 if (ai_msgs.length === 0) return "";
                 return ai_msgs[ai_msgs.length - 1].innerText; 
             }""")
-        except: 
-            return last_text.strip()
-            
+        except: return last_text.strip()
         last_text = text
         cur_len = len(text.strip())
         
-        if cur_len == last_len and cur_len >= min_len and "{" in text and "}" in text:
+        # 🚨 V8.7 放宽判定条件，只要长度足够就认为开始生成了
+        if cur_len == last_len and cur_len >= min_len:
             stable += 1
             if stable >= stable_rounds: return text.strip()
         else:
             stable = 0
             last_len = cur_len
-            
-    page.screenshot(path=f"data/debug_{label}_timeout.png")
     return last_text.strip()
 
-def parse_jsonlines(text: str) -> list:
+# ==============================================================================
+# 🚨 V8.7 核心黑科技：自然语言伪装与提取器
+# ==============================================================================
+def parse_nlp_to_jsonl(text: str) -> list:
+    """把大模型生成的半结构化自然文本提取为我们的标准字典列表"""
     results = []
-    text = re.sub(r'^`{3}(?:jsonl|json)?\n', '', text, flags=re.MULTILINE)
-    text = re.sub(r'^`{3}\n?', '', text, flags=re.MULTILINE)
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or not line.startswith('{') or not line.endswith('}'): continue
-        try: results.append(json.loads(line))
-        except: continue
+    
+    # 提取 Posts
+    # 格式预期: @账号名 || 1000 || 0313 || 这是一段总结
+    post_pattern = re.compile(r'@([a-zA-Z0-9_]+)\s*\|\|\s*(\d+)\s*\|\|\s*(\d{4})\s*\|\|\s*(.*?)(?=\n@|\n###|\n$)', re.IGNORECASE | re.DOTALL)
+    for match in post_pattern.finditer(text):
+        results.append({
+            "a": match.group(1).strip(),
+            "l": int(match.group(2).strip()),
+            "t": match.group(3).strip(),
+            "s": match.group(4).strip().replace('\n', ' '),
+            "tag": "raw"
+        })
+        
+    # 提取 Meta
+    # 格式预期: META: @账号名 || 10 || 5000 || 0313
+    meta_pattern = re.compile(r'META:\s*@([a-zA-Z0-9_]+)\s*\|\|\s*(\d+)\s*\|\|\s*(\d+)\s*\|\|\s*([0-9NAa-zA-Z]+)', re.IGNORECASE)
+    for match in meta_pattern.finditer(text):
+        results.append({
+            "a": match.group(1).strip(),
+            "type": "meta",
+            "total": int(match.group(2).strip()),
+            "max_l": int(match.group(3).strip()),
+            "latest": match.group(4).strip()
+        })
+        
     return results
 
-# ==============================================================================
-# 🤖 抓取策略 Prompts 
-# ==============================================================================
 def build_phase1_prompt(accounts: list) -> str:
     rounds = [accounts[i:i+3] for i in range(0, len(accounts), 3)]
     rounds_text = "\n".join(f"Round {i+1}: {' | '.join(r)}" for i, r in enumerate(rounds))
     return (
-        "You are an X/Twitter data collection tool. Search the following accounts and output pure JSON Lines format.\n\n"
-        "[Search Rules]\n"
-        "1. Search each account individually: x_keyword_search query=from:AccountName, mode=Latest, limit=10\n"
-        "2. Execute in parallel rounds (3 accounts per round)\n"
-        "3. Output newest 3 posts + 1 metadata row per account\n\n"
-        f"[Account List]\n{rounds_text}\n\n"
-        "[Output Format (JSON Lines ONLY)]\n"
-        '  Post: {"a":"AccountName","l":likes,"t":"MMDD","s":"English summary","tag":"raw"}\n'
-        '  Meta: {"a":"AccountName","type":"meta","total":count,"max_l":max_likes,"latest":"MMDD"}\n'
+        "Please help me organize some recent tweets from specific users. Search them one by one and format the output like a simple text list, NOT code, NOT json.\n\n"
+        "Here is what you need to do:\n"
+        "1. Use search to find latest tweets from these users.\n"
+        "2. For each user, give me their 3 newest tweets in this exact text format:\n"
+        "@AccountName || LikesCount || MMDD || English summary of the tweet\n"
+        "3. After their tweets, add ONE line about their activity level in this exact format:\n"
+        "META: @AccountName || TotalPostsCount || MaxLikesCount || LatestPostMMDD\n\n"
+        f"The users are:\n{rounds_text}\n\n"
+        "Just output the formatted text lines. Do not wrap in markdown code blocks. Keep it simple and natural."
     )
 
 def build_phase2_s_prompt(accounts: list) -> str:
-    rounds = [accounts[i:i+3] for i in range(0, len(accounts), 3)]
-    rounds_text = "\n".join(f"Round {i+1}: {' | '.join(r)}" for i, r in enumerate(rounds))
+    rounds_text = "\n".join(f"Round 1: {' | '.join(accounts)}")
     return (
-        "You are an X/Twitter data collection tool. Deep-collect S-tier accounts, output pure JSON Lines.\n\n"
-        "1. x_keyword_search query=from:AccountName, mode=Latest, limit=10\n"
-        "2. Output all 10 posts\n"
-        f"[S-tier Accounts]\n{rounds_text}\n\n"
-        "[Output Format (JSON Lines ONLY)]\n"
-        '  Normal: {"a":"Name","l":likes,"t":"MMDD","s":"English summary","tag":"raw"}\n'
-        '  Quote:  {"a":"Name","l":likes,"t":"MMDD","s":"summary","qt":"@orig: summary","tag":"raw"}\n'
+        "Please help me summarize recent high-quality tweets from these specific users. Format the output like a simple text list, NOT code, NOT json.\n\n"
+        "Here is what you need to do:\n"
+        "1. Use search to find their latest tweets.\n"
+        "2. For each user, give me up to 10 newest tweets in this exact text format:\n"
+        "@AccountName || LikesCount || MMDD || English summary of the tweet\n\n"
+        f"The users are:\n{rounds_text}\n\n"
+        "Just output the formatted text lines. Do not wrap in markdown code blocks. Keep it natural."
     )
 
 def build_phase2_a_prompt(accounts: list) -> str:
-    rounds = [accounts[i:i+3] for i in range(0, len(accounts), 3)]
-    rounds_text = "\n".join(f"Round {i+1}: {' | '.join(r)}" for i, r in enumerate(rounds))
-    return (
-        "You are an X/Twitter data collection tool. Collect A-tier accounts, output pure JSON Lines.\n\n"
-        "1. x_keyword_search query=from:AccountName, mode=Latest, limit=5\n"
-        "2. Output up to 5 posts\n"
-        f"[A-tier Accounts]\n{rounds_text}\n\n"
-        "[Output Format (JSON Lines ONLY)]\n"
-        '  Normal: {"a":"Name","l":likes,"t":"MMDD","s":"summary","tag":"raw"}\n'
-        '  Quote:  {"a":"Name","l":likes,"t":"MMDD","s":"summary","qt":"@orig: summary","tag":"raw"}\n'
-    )
+    return build_phase2_s_prompt(accounts) # A 级由于降低了额度，其实可以直接复用 S 级的自然语言 Prompt
 
 def run_grok_batch_with_relay(browser, cookie_configs, accounts: list, prompt_builder, label: str):
-    """🚨 核心接力引擎：如果当前账号被限流，自动切换下一个账号！"""
     if not accounts: return []
-    
     global _current_cookie_idx
     attempts = 0
     max_attempts = len(cookie_configs)
@@ -365,7 +243,7 @@ def run_grok_batch_with_relay(browser, cookie_configs, accounts: list, prompt_bu
         page = open_grok_page(context, env_key)
         
         if not page:
-            print(f"[{label}] ❌ 账号 {env_key} 登录失效，切换下一个...", flush=True)
+            print(f"[{label}] ❌ 账号失效，切换下一个...", flush=True)
             context.close()
             _current_cookie_idx = (_current_cookie_idx + 1) % len(cookie_configs)
             attempts += 1
@@ -375,39 +253,30 @@ def run_grok_batch_with_relay(browser, cookie_configs, accounts: list, prompt_bu
             prompt = prompt_builder(accounts)
             send_prompt(page, prompt, label)
             
-            print(f"[{label}] 等待 60s 让 Grok 搜索...", flush=True)
-            time.sleep(60)
-            raw_text = wait_and_extract(page, label, interval=5, stable_rounds=5, max_wait=420, extend_if_growing=True, min_len=50)
-            results = parse_jsonlines(raw_text)
+            print(f"[{label}] 等待 Grok 处理...", flush=True)
+            raw_text = wait_and_extract(page, label, interval=5, stable_rounds=4, max_wait=300, min_len=40)
+            
+            # 🚨 重点：通过正则解析自然语言提取数据
+            results = parse_nlp_to_jsonl(raw_text)
             
             if len(results) > 0:
-                print(f"[{label}] ✅ 成功抓取 {len(results)} 条数据！", flush=True)
-                save_and_renew_session(context, env_key)
-                page.close()
-                context.close()
+                print(f"[{label}] ✅ 成功提取 {len(results)} 条记录！", flush=True)
+                page.close(); context.close()
                 return results
             else:
-                print(f"[{label}] ⚠️ 账号 {env_key} 被限流或报错 (返回 0 条 JSON)。", flush=True)
-                print(f"[{label}] 🤖 Grok 的遗言: {raw_text[:300]}...", flush=True)
-                
-                # 保存一下被限流的账号状态，然后关闭
-                save_and_renew_session(context, env_key)
-                page.close()
-                context.close()
-                
-                # 切换下一个号
+                print(f"[{label}] ⚠️ 提取到 0 条记录。Grok 的原文是: \n{raw_text[:200]}...", flush=True)
+                page.close(); context.close()
                 _current_cookie_idx = (_current_cookie_idx + 1) % len(cookie_configs)
                 attempts += 1
-                print(f"[{label}] 🔄 正在无缝切换到备用账号...", flush=True)
                 
         except Exception as e:
-            print(f"[{label}] 💥 运行崩溃: {e}", flush=True)
+            print(f"[{label}] 💥 崩溃: {e}", flush=True)
             try: page.close(); context.close()
             except: pass
             _current_cookie_idx = (_current_cookie_idx + 1) % len(cookie_configs)
             attempts += 1
 
-    print(f"[{label}] 💀 灾难：所有配置的 Grok 账号均已耗尽或被限流！", flush=True)
+    print(f"[{label}] 💀 所有 Grok 账号均告失败！", flush=True)
     return []
 
 def classify_accounts(meta_results: dict) -> dict:
@@ -432,7 +301,7 @@ def classify_accounts(meta_results: dict) -> dict:
     return classification
 
 # ==============================================================================
-# 🚀 第二阶段：纯 XML 提示词与 xAI 提纯 
+# 🚀 xAI 排版与渲染
 # ==============================================================================
 def _build_xml_prompt(combined_jsonl: str, today_str: str) -> str:
     return f"""
@@ -440,396 +309,142 @@ def _build_xml_prompt(combined_jsonl: str, today_str: str) -> str:
 分析过去24小时内科技大佬的推文和全球热点，提炼出有投资和实操价值的洞察，用犀利、专业的中文进行总结。
 
 【重要纪律】
-1. 禁止输出任何 Markdown 排版符号（如 #, *, >, -）。
-2. 只允许输出纯文本内容，并严格按照以下 XML 标签结构填入信息。不要缺漏闭合标签。
-3. Title（头衔/身份）绝对不要翻译，保持纯英文。
-4. 🚨【翻译铁律】所有的 <TWEET> 标签内容，【必须以中文为主体】！绝对禁止直接复制粘贴纯英文段落！为了保留内行风味，你可以不翻译特定的英文黑话、梗或专有名词（如 "poached", "R-rated" 等），但句子的骨架和整体含义必须翻译为流畅的中文！
+1. 只允许输出纯文本内容，并严格按照以下 XML 标签结构填入信息。不要缺漏闭合标签。
+2. 🚨所有的 <TWEET> 标签内容，【必须以中文为主体】翻译！
 
 【输出结构规范】
 <REPORT>
-  <COVER title="5-10字中文爆款标题" prompt="100字英文图生图提示词，赛博朋克风" insight="30字内核心洞察，中文"/>
-  <PULSE>用一句话总结今日最核心的 1-2 个行业动态信号。</PULSE>
-  
+  <COVER title="5-10字中文标题" prompt="100字英文图生图提示词" insight="30字内核心洞察，中文"/>
+  <PULSE>一句话总结核心动态。</PULSE>
   <THEMES>
     <THEME type="shift" emoji="⚔️">
-      <TITLE>主题标题：副标题 (请挖掘 3-5 个独立话题)</TITLE>
-      <NARRATIVE>一句话核心判断（直接输出观点文本，不要带前缀）</NARRATIVE>
-      <TWEET account="X账号名" role="英文身份标签">以中文为主翻译原文观点，可夹杂少量英文黑话</TWEET>
-      <TWEET account="..." role="...">...</TWEET>
-      <CONSENSUS>核心共识的纯文本描述（直接输出观点，不要带前缀）</CONSENSUS>
-      <DIVERGENCE>最大分歧的纯文本描述（直接输出观点，不要带前缀）</DIVERGENCE>
-    </THEME>
-
-    <THEME type="new" emoji="🌱">
-      <TITLE>主题标题：副标题 (请挖掘 3-5 个独立话题)</TITLE>
-      <NARRATIVE>一句话新趋势定义（直接输出观点文本，不要带前缀）</NARRATIVE>
-      <TWEET account="X账号名" role="英文身份标签">以中文为主翻译原文观点，可夹杂少量英文黑话</TWEET>
-      <TWEET account="..." role="...">...</TWEET>
-      <OUTLOOK>对该新叙事的深度解读与未来展望</OUTLOOK>
-      <OPPORTUNITY>可能带来的机会</OPPORTUNITY>
-      <RISK>警惕的陷阱或风险</RISK>
+      <TITLE>主题标题：副标题</TITLE>
+      <NARRATIVE>一句话核心判断</NARRATIVE>
+      <TWEET account="X账号名" role="英文身份标签">中文翻译原文观点</TWEET>
+      <CONSENSUS>核心共识</CONSENSUS>
+      <DIVERGENCE>最大分歧</DIVERGENCE>
     </THEME>
   </THEMES>
-
   <INVESTMENT_RADAR>
-    <ITEM category="投融资快讯">具体的融资额与领投机构等。</ITEM>
-    <ITEM category="VC views">顶级机构投资风向警示等。</ITEM>
+    <ITEM category="类别">内容</ITEM>
   </INVESTMENT_RADAR>
-
-  <RISK_CHINA_VIEW>
-    <ITEM category="中国 AI 评价">对中国大模型的技术评价等。</ITEM>
-    <ITEM category="地缘与监管">出口、合规、版权风险等。</ITEM>
-  </RISK_CHINA_VIEW>
-
-  <TOP_PICKS>
-    <TWEET account="..." role="...">【严禁纯英文】流畅中文精译，保留关键英文梗增强表现力</TWEET>
-  </TOP_PICKS>
 </REPORT>
 
-# 原始数据输入 (JSONL):
+# 原始数据 (纯文本列表):
 {combined_jsonl}
 # 日期: {today_str}
 """
 
 def llm_call_xai(combined_jsonl: str, today_str: str) -> str:
     api_key = XAI_API_KEY.strip()
-    if not api_key: 
-        print("[LLM/xAI] Error: XAI_API_KEY is missing!")
-        return ""
-    
-    max_data_chars = 100000 
-    data = combined_jsonl[:max_data_chars] if len(combined_jsonl) > max_data_chars else combined_jsonl
+    if not api_key: return ""
+    data = combined_jsonl[:100000]
     prompt = _build_xml_prompt(data, today_str)
-    
-    model_name = "grok-4.20-beta-latest-non-reasoning" 
     client = Client(api_key=api_key)
-    print(f"\n[LLM/xAI] Requesting {model_name} via Official xai-sdk...", flush=True)
-    
+    print(f"\n[LLM/xAI] Requesting via Official xai-sdk...", flush=True)
     for attempt in range(1, 4):
         try:
-            chat = client.chat.create(model=model_name)
-            chat.append(system("You are a professional analytical bot. You strictly output in XML format as instructed. Do not ignore the translation rules."))
+            chat = client.chat.create(model="grok-4.20-beta-latest-non-reasoning")
+            chat.append(system("You are a professional analytical bot. You strictly output in XML."))
             chat.append(user(prompt))
-            result = chat.sample().content.strip()
-            print(f"[LLM/xAI] OK Response received ({len(result)} chars)", flush=True)
-            return result
-        except Exception as e: 
-            print(f"[LLM/xAI] attempt {attempt} failed: {e}", flush=True)
-            time.sleep(2 ** attempt)
+            return chat.sample().content.strip()
+        except: time.sleep(2 ** attempt)
     return ""
 
 def parse_llm_xml(xml_text: str) -> dict:
     data = {"cover": {"title": "", "prompt": "", "insight": ""}, "pulse": "", "themes": [], "investment_radar": [], "risk_china_view": [], "top_picks": []}
     if not xml_text: return data
-
     cover_match = re.search(r'<COVER\s+title=[\'"“”](.*?)[\'"“”]\s+prompt=[\'"“”](.*?)[\'"“”]\s+insight=[\'"“”](.*?)[\'"“”]\s*/?>', xml_text, re.IGNORECASE | re.DOTALL)
-    if not cover_match: cover_match = re.search(r'<COVER\s+title="(.*?)"\s+prompt="(.*?)"\s+insight="(.*?)"\s*/?>', xml_text, re.IGNORECASE | re.DOTALL)
     if cover_match: data["cover"] = {"title": cover_match.group(1).strip(), "prompt": cover_match.group(2).strip(), "insight": cover_match.group(3).strip()}
-        
     pulse_match = re.search(r'<PULSE>(.*?)</PULSE>', xml_text, re.IGNORECASE | re.DOTALL)
     if pulse_match: data["pulse"] = pulse_match.group(1).strip()
-        
     for theme_match in re.finditer(r'<THEME([^>]*)>(.*?)</THEME>', xml_text, re.IGNORECASE | re.DOTALL):
-        attrs = theme_match.group(1)
-        theme_body = theme_match.group(2)
-        type_m = re.search(r'type\s*=\s*[\'"“”](.*?)[\'"“”]', attrs, re.IGNORECASE)
+        attrs, theme_body = theme_match.group(1), theme_match.group(2)
         emoji_m = re.search(r'emoji\s*=\s*[\'"“”](.*?)[\'"“”]', attrs, re.IGNORECASE)
-        theme_type = type_m.group(1).strip().lower() if type_m else "shift"
-        emoji = emoji_m.group(1).strip() if emoji_m else "🔥"
-        
         t_tag = re.search(r'<TITLE>(.*?)</TITLE>', theme_body, re.IGNORECASE | re.DOTALL)
-        theme_title = t_tag.group(1).strip() if t_tag else "未命名主题"
-        
         narrative_match = re.search(r'<NARRATIVE>(.*?)</NARRATIVE>', theme_body, re.IGNORECASE | re.DOTALL)
-        narrative = narrative_match.group(1).strip() if narrative_match else ""
-        
-        tweets = []
-        for t_match in re.finditer(r'<TWEET\s+account=[\'"“”](.*?)[\'"“”]\s+role=[\'"“”](.*?)[\'"“”]>(.*?)</TWEET>', theme_body, re.IGNORECASE | re.DOTALL):
-            tweets.append({"account": t_match.group(1).strip(), "role": t_match.group(2).strip(), "content": t_match.group(3).strip()})
-        if not tweets:
-            for t_match in re.finditer(r'<TWEET\s+account="(.*?)"\s+role="(.*?)">(.*?)</TWEET>', theme_body, re.IGNORECASE | re.DOTALL):
-                tweets.append({"account": t_match.group(1).strip(), "role": t_match.group(2).strip(), "content": t_match.group(3).strip()})
-        
-        con_match = re.search(r'<CONSENSUS>(.*?)</CONSENSUS>', theme_body, re.IGNORECASE | re.DOTALL)
-        consensus = con_match.group(1).strip() if con_match else ""
-        div_match = re.search(r'<DIVERGENCE>(.*?)</DIVERGENCE>', theme_body, re.IGNORECASE | re.DOTALL)
-        divergence = div_match.group(1).strip() if div_match else ""
-        
-        out_match = re.search(r'<OUTLOOK>(.*?)</OUTLOOK>', theme_body, re.IGNORECASE | re.DOTALL)
-        outlook = out_match.group(1).strip() if out_match else ""
-        opp_match = re.search(r'<OPPORTUNITY>(.*?)</OPPORTUNITY>', theme_body, re.IGNORECASE | re.DOTALL)
-        opportunity = opp_match.group(1).strip() if opp_match else ""
-        risk_match = re.search(r'<RISK>(.*?)</RISK>', theme_body, re.IGNORECASE | re.DOTALL)
-        risk = risk_match.group(1).strip() if risk_match else ""
-        
-        data["themes"].append({
-            "type": theme_type, "emoji": emoji, "title": theme_title, "narrative": narrative, "tweets": tweets,
-            "consensus": consensus, "divergence": divergence, "outlook": outlook, "opportunity": opportunity, "risk": risk
-        })
-        
-    def extract_items(tag_name, target_list):
-        block_match = re.search(rf'<{tag_name}>(.*?)</{tag_name}>', xml_text, re.IGNORECASE | re.DOTALL)
-        if block_match:
-            for item in re.finditer(r'<ITEM\s+category=[\'"“”](.*?)[\'"“”]>(.*?)</ITEM>', block_match.group(1), re.IGNORECASE | re.DOTALL):
-                target_list.append({"category": item.group(1).strip(), "content": item.group(2).strip()})
-
-    extract_items("INVESTMENT_RADAR", data["investment_radar"])
-    extract_items("RISK_CHINA_VIEW", data["risk_china_view"])
-
-    picks_match = re.search(r'<TOP_PICKS>(.*?)</TOP_PICKS>', xml_text, re.IGNORECASE | re.DOTALL)
-    if picks_match:
-        for t_match in re.finditer(r'<TWEET\s+account=[\'"“”](.*?)[\'"“”]\s+role=[\'"“”](.*?)[\'"“”]>(.*?)</TWEET>', picks_match.group(1), re.IGNORECASE | re.DOTALL):
-            data["top_picks"].append({"account": t_match.group(1).strip(), "role": t_match.group(2).strip(), "content": t_match.group(3).strip()})
-            
+        tweets = [{"account": t.group(1).strip(), "role": t.group(2).strip(), "content": t.group(3).strip()} for t in re.finditer(r'<TWEET\s+account=[\'"“”](.*?)[\'"“”]\s+role=[\'"“”](.*?)[\'"“”]>(.*?)</TWEET>', theme_body, re.IGNORECASE | re.DOTALL)]
+        data["themes"].append({"emoji": emoji_m.group(1).strip() if emoji_m else "🔥", "title": t_tag.group(1).strip() if t_tag else "", "narrative": narrative_match.group(1).strip() if narrative_match else "", "tweets": tweets})
     return data
 
-# ==============================================================================
-# 🚀 第三阶段：结构化渲染引擎 (双模态自适应)
-# ==============================================================================
 def render_feishu_card(parsed_data: dict, today_str: str):
     webhooks = get_feishu_webhooks()
     if not webhooks or not parsed_data.get("pulse"): return
-
-    elements = []
-    elements.append({"tag": "markdown", "content": f"**▌ ⚡️ 今日看板 (The Pulse)**\n<font color='grey'>{parsed_data['pulse']}</font>"})
-    elements.append({"tag": "hr"})
-
-    if parsed_data["themes"]:
-        elements.append({"tag": "markdown", "content": "**▌ 🧠 深度叙事追踪**"})
-        for idx, theme in enumerate(parsed_data["themes"]):
-            theme_md = f"**{theme['emoji']} {theme['title']}**\n"
-            prefix = "🔭 新叙事观察" if theme.get("type") == "new" else "💡 叙事转向"
-            theme_md += f"<font color='grey'>{prefix}：{theme['narrative']}</font>\n"
-            
-            for t in theme["tweets"]:
-                theme_md += f"🗣️ **@{t['account']} | {t['role']}**\n<font color='grey'>“{t['content']}”</font>\n"
-            
-            if theme.get("type") == "new":
-                if theme.get("outlook"): theme_md += f"<font color='blue'>**🔮 解读与展望：**</font> {theme['outlook']}\n"
-                if theme.get("opportunity"): theme_md += f"<font color='green'>**🎯 潜在机会：**</font> {theme['opportunity']}\n"
-                if theme.get("risk"): theme_md += f"<font color='red'>**⚠️ 潜在风险：**</font> {theme['risk']}\n"
-            else:
-                if theme.get("consensus"): theme_md += f"<font color='red'>**🔥 核心共识：**</font> {theme['consensus']}\n"
-                if theme.get("divergence"): theme_md += f"<font color='red'>**⚔️ 最大分歧：**</font> {theme['divergence']}\n"
-            
-            elements.append({"tag": "markdown", "content": theme_md.strip()})
-            if idx < len(parsed_data["themes"]) - 1: elements.append({"tag": "hr"})
+    elements = [{"tag": "markdown", "content": f"**⚡️ {parsed_data['pulse']}**\n---\n"}]
+    for theme in parsed_data["themes"]:
+        md = f"**{theme['emoji']} {theme['title']}**\n<font color='grey'>{theme['narrative']}</font>\n"
+        for t in theme["tweets"]: md += f"🗣️ **@{t['account']}**\n<font color='grey'>“{t['content']}”</font>\n"
+        elements.append({"tag": "markdown", "content": md.strip()})
         elements.append({"tag": "hr"})
-
-    def add_list_section(title, icon, items):
-        if not items: return
-        content = f"**▌ {icon} {title}**\n\n"
-        for item in items: content += f"👉 **{item['category']}**：<font color='grey'>{item['content']}</font>\n"
-        elements.append({"tag": "markdown", "content": content.strip()})
-        elements.append({"tag": "hr"})
-
-    add_list_section("资本与估值雷达 (Investment Radar)", "💰", parsed_data["investment_radar"])
-    add_list_section("风险与中国视角 (Risk & China View)", "📊", parsed_data["risk_china_view"])
-
-    if parsed_data["top_picks"]:
-        picks_md = "**▌ 📣 今日精选推文 (Top 5 Picks)**\n"
-        for t in parsed_data["top_picks"]:
-            picks_md += f"\n🗣️ **@{t['account']} | {t['role']}**\n<font color='grey'>\"{t['content']}\"</font>\n"
-        elements.append({"tag": "markdown", "content": picks_md.strip()})
-
-    card_payload = {
-        "msg_type": "interactive",
-        "card": {
-            "config": {"wide_screen_mode": True, "enable_forward": True},
-            "header": {"title": {"content": f"昨晚硅谷在聊啥 | {today_str}", "tag": "plain_text"}, "template": "blue"},
-            "elements": elements + [{"tag": "note", "elements": [{"tag": "plain_text", "content": "Powered by Grok Web Scraper + xAI SDK"}]}]
-        }
-    }
-
+    card_payload = {"msg_type": "interactive", "card": {"config": {"wide_screen_mode": True}, "header": {"title": {"content": f"硅谷科技雷达 | {today_str}", "tag": "plain_text"}, "template": "blue"}, "elements": elements}}
     for url in webhooks:
         try: requests.post(url, json=card_payload, timeout=20)
         except: pass
-
-def render_wechat_html(parsed_data: dict, cover_url: str = "") -> str:
-    html_lines = []
-    if cover_url: html_lines.append(f'<p style="text-align:center;margin:0 0 16px 0;"><img src="{cover_url}" style="max-width:100%;border-radius:8px;" /></p>')
-    if parsed_data["cover"].get("insight"):
-        html_lines.append(f'<div style="border-radius:8px;background:#FFF7E6;padding:12px 14px;margin:0 0 20px 0;color:#d97706;"><div style="font-weight:bold;margin-bottom:6px;">💡 Insight | 昨晚硅谷在聊啥？</div><div>{parsed_data["cover"]["insight"]}</div></div>')
-
-    def make_h3(title): return f'<h3 style="margin:24px 0 12px 0;font-size:18px;border-left:4px solid #4A90E2;padding-left:10px;color:#2c3e50;font-weight:bold;">{title}</h3>'
-    def make_quote(content): return f'<div style="background:#f8f9fa;border-left:4px solid #8c98a4;padding:10px 14px;color:#555;font-size:15px;border-radius:0 4px 4px 0;margin:6px 0 10px 0;line-height:1.6;">{content}</div>'
-
-    html_lines.append(make_h3("⚡️ 今日看板 (The Pulse)"))
-    html_lines.append(make_quote(parsed_data.get('pulse', '')))
-
-    if parsed_data["themes"]:
-        html_lines.append(make_h3("🧠 深度叙事追踪"))
-        for idx, theme in enumerate(parsed_data["themes"]):
-            html_lines.append(f'<p style="font-weight:bold;font-size:16px;color:#1e293b;margin:16px 0 8px 0;">{theme["emoji"]} {theme["title"]}</p>')
-            
-            if theme.get("type") == "new":
-                html_lines.append(f'<div style="background:#f4f8fb; padding:10px 12px; border-radius:6px; margin:0 0 8px 0; font-size:14px; color:#2c3e50;"><strong>🔭 新叙事观察：</strong>{theme["narrative"]}</div>')
-            else:
-                html_lines.append(f'<div style="background:#f4f8fb; padding:10px 12px; border-radius:6px; margin:0 0 8px 0; font-size:14px; color:#2c3e50;"><strong>💡 叙事转向：</strong>{theme["narrative"]}</div>')
-                
-            for t in theme["tweets"]:
-                html_lines.append(f'<p style="margin:8px 0 2px 0;font-size:14px;font-weight:bold;color:#2c3e50;">🗣️ @{t["account"]} <span style="color:#94a3b8;font-weight:normal;">| {t["role"]}</span></p>')
-                html_lines.append(make_quote(f'"{t["content"]}"'))
-            
-            if theme.get("type") == "new":
-                if theme.get("outlook"): html_lines.append(f'<p style="margin:6px 0; font-size:15px; line-height:1.6; background:#eef2ff; padding: 8px 12px; border-radius: 4px;"><strong style="color:#4f46e5;">🔮 解读与展望：</strong>{theme["outlook"]}</p>')
-                if theme.get("opportunity"): html_lines.append(f'<p style="margin:6px 0; font-size:15px; line-height:1.6; background:#f0fdf4; padding: 8px 12px; border-radius: 4px;"><strong style="color:#16a34a;">🎯 潜在机会：</strong>{theme["opportunity"]}</p>')
-                if theme.get("risk"): html_lines.append(f'<p style="margin:6px 0; font-size:15px; line-height:1.6; background:#fef2f2; padding: 8px 12px; border-radius: 4px;"><strong style="color:#dc2626;">⚠️ 潜在风险：</strong>{theme["risk"]}</p>')
-            else:
-                if theme.get("consensus"): html_lines.append(f'<p style="margin:6px 0; font-size:15px; line-height:1.6; background:#fff5f5; padding: 8px 12px; border-radius: 4px;"><strong style="color:#d35400;">🔥 核心共识：</strong>{theme["consensus"]}</p>')
-                if theme.get("divergence"): html_lines.append(f'<p style="margin:6px 0; font-size:15px; line-height:1.6; background:#fff5f5; padding: 8px 12px; border-radius: 4px;"><strong style="color:#d35400;">⚔️ 最大分歧：</strong>{theme["divergence"]}</p>')
-            
-            if idx < len(parsed_data["themes"]) - 1: html_lines.append('<hr style="border:none;border-top:1px dashed #cbd5e1;margin:24px 0;"/>')
-
-    def make_list_section(title, items):
-        if not items: return
-        html_lines.append(make_h3(title))
-        for item in items: html_lines.append(f'<p style="margin:10px 0;font-size:15px;line-height:1.6;">👉 <strong style="color:#2c3e50;">{item["category"]}：</strong><span style="color:#333;">{item["content"]}</span></p>')
-
-    make_list_section("💰 资本与估值雷达 (Investment Radar)", parsed_data["investment_radar"])
-    make_list_section("📊 风险与中国视角 (Risk & China View)", parsed_data["risk_china_view"])
-
-    if parsed_data["top_picks"]:
-        html_lines.append(make_h3("📣 今日精选推文 (Top 5 Picks)"))
-        for t in parsed_data["top_picks"]:
-             html_lines.append(f'<p style="margin:12px 0 4px 0;font-size:14px;font-weight:bold;color:#2c3e50;">🗣️ @{t["account"]} <span style="color:#94a3b8;font-weight:normal;">| {t["role"]}</span></p>')
-             html_lines.append(make_quote(f'"{t["content"]}"'))
-
-    return "<br/>".join(html_lines)
-
-def generate_cover_image(prompt):
-    if not SF_API_KEY or not prompt: return ""
-    try:
-        resp = requests.post(URL_SF_IMAGE, headers={"Authorization": f"Bearer {SF_API_KEY}", "Content-Type": "application/json"}, json={"model": "black-forest-labs/FLUX.1-schnell", "prompt": prompt, "n": 1, "image_size": "1024x576"}, timeout=60)
-        if resp.status_code == 200: return resp.json().get("images", [{}])[0].get("url") or resp.json().get("data", [{}])[0].get("url")
-    except: return ""
-
-def upload_to_imgbb_via_url(sf_url):
-    if not IMGBB_API_KEY or not sf_url: return sf_url 
-    try:
-        img_resp = requests.get(sf_url, timeout=30)
-        img_b64 = base64.b64encode(img_resp.content).decode("utf-8")
-        upload_resp = requests.post(URL_IMGBB, data={"key": IMGBB_API_KEY, "image": img_b64}, timeout=45)
-        if upload_resp.status_code == 200: return upload_resp.json()["data"]["url"]
-    except: return sf_url
 
 def push_to_jijyun(html_content, title, cover_url=""):
     if not JIJYUN_WEBHOOK_URL: return
     try: requests.post(JIJYUN_WEBHOOK_URL, json={"title": title, "author": "Prinski", "html_content": html_content, "cover_jpg": cover_url}, timeout=30)
     except: pass
 
-def save_daily_data(today_str: str, post_objects: list, report_text: str):
-    data_dir = Path(f"data/{today_str}")
-    data_dir.mkdir(parents=True, exist_ok=True)
-    combined_txt = "\n".join(json.dumps(obj, ensure_ascii=False) for obj in post_objects)
-    (data_dir / "combined.txt").write_text(combined_txt, encoding="utf-8")
-    if report_text: (data_dir / "daily_report.txt").write_text(report_text, encoding="utf-8")
-
-
-# 🚨 全局记录当前使用的 Cookie 序号
 _current_cookie_idx = 0
 
-# ==============================================================================
-# 🚀 主程序入口
-# ==============================================================================
 def main():
     global _current_cookie_idx
     print("=" * 60, flush=True)
-    mode_str = "测试模式(1个Batch-6人)" if TEST_MODE else "全量模式"
-    print(f"昨晚硅谷在聊啥 v8.6 (无限接力版 + 专家模式直驱 + xAI提纯 - {mode_str})", flush=True)
+    mode_str = "测试模式(6人)" if TEST_MODE else "全量模式"
+    print(f"硅谷百人雷达 v8.7 (自然语言伪装防封版 - {mode_str})", flush=True)
     print("=" * 60, flush=True)
 
     today_str, _ = get_dates()
     Path("data").mkdir(exist_ok=True)
     
-    # 🚨 1. 装载所有的 Cookie 配置 (支持 SUPER_GROK_COOKIES 到 SUPER_GROK_COOKIES_5)
     cookie_configs = get_available_cookies()
     if not cookie_configs:
-        print("💥 致命错误：未找到任何 SUPER_GROK_COOKIES 环境变量！", flush=True)
+        print("💥 致命错误：未找到任何 Cookie！", flush=True)
         return
-    print(f"🔑 成功装载 {len(cookie_configs)} 个 Grok 账号，准备开启无限接力抓取！", flush=True)
     
-    # 检查是否即将过期
-    check_cookie_expiry(cookie_configs)
-
     selected_accounts = ALL_ACCOUNTS[:6] if TEST_MODE else ALL_ACCOUNTS
     meta_results, phase1_posts, phase2_posts = {}, {}, {}
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-blink-features=AutomationControlled", "--window-size=1280,800"]
-        )
-
-        # --- Phase 1: 扫描 ---
-        BATCH_SIZE = 20
+        browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"])
+        
+        BATCH_SIZE = 10
         for batch_num, batch_start in enumerate(range(0, len(selected_accounts), BATCH_SIZE), start=1):
             if TEST_MODE and batch_num > 1: break
-            if time.time() - _START_TIME > PHASE1_DEADLINE: break
-            
             batch = selected_accounts[batch_start:batch_start + BATCH_SIZE]
             label = f"Phase1-Batch{batch_num}"
-            
-            # 🚨 核心逻辑：利用多个账号轮流尝试，直到成功或全部耗尽
             results = run_grok_batch_with_relay(browser, cookie_configs, batch, build_phase1_prompt, label)
-            
             for obj in results:
-                account = obj.get("a", "").lstrip("@")
-                if not account: continue
-                if obj.get("type") == "meta": meta_results[account] = obj
-                else: phase1_posts.setdefault(account, []).append(obj)
+                acc = obj.get("a", "")
+                if obj.get("type") == "meta": meta_results[acc] = obj
+                else: phase1_posts.setdefault(acc, []).append(obj)
 
         classification = classify_accounts(meta_results)
         s_accounts = [a for a, t in classification.items() if t == "S"]
-        a_accounts = [a for a, t in classification.items() if t == "A"]
         
-        # --- Phase 2: S 级深挖 ---
-        if s_accounts and time.time() - _START_TIME < GLOBAL_DEADLINE:
+        if s_accounts:
             s_results = run_grok_batch_with_relay(browser, cookie_configs, s_accounts, build_phase2_s_prompt, "Phase2-S")
             for obj in s_results:
-                if obj.get("type") != "meta": phase2_posts.setdefault(obj.get("a", "").lstrip("@"), []).append(obj)
-
-        # --- Phase 2: A 级深挖 ---
-        if a_accounts and time.time() - _START_TIME < GLOBAL_DEADLINE:
-            a_results = run_grok_batch_with_relay(browser, cookie_configs, a_accounts, build_phase2_a_prompt, "Phase2-A")
-            for obj in a_results:
-                if obj.get("type") != "meta": phase2_posts.setdefault(obj.get("a", "").lstrip("@"), []).append(obj)
+                if obj.get("type") != "meta": phase2_posts.setdefault(obj.get("a", ""), []).append(obj)
 
         browser.close()
 
-    # 组装 JSONL 喂给 xAI SDK
     all_posts_flat = []
-    for acc in s_accounts + a_accounts:
+    for acc in list(phase1_posts.keys()) + list(phase2_posts.keys()):
         all_posts_flat.extend(phase2_posts.get(acc) or phase1_posts.get(acc) or [])
-    for acc in [a for a, t in classification.items() if t == "B"]:
-        all_posts_flat.extend(phase1_posts.get(acc) or [])
 
-    combined_jsonl = "\n".join(json.dumps(obj, ensure_ascii=False) for obj in all_posts_flat if obj.get("type") != "meta")
-    print(f"\n[Data] Ready for xAI SDK: {len(all_posts_flat)} posts.")
+    combined_jsonl = "\n".join(json.dumps(obj, ensure_ascii=False) for obj in all_posts_flat)
+    print(f"\n[Data] Ready for xAI: {len(all_posts_flat)} posts.")
 
     if combined_jsonl.strip():
         xml_result = llm_call_xai(combined_jsonl, today_str)
         if xml_result:
-            print("\n[Parser] Parsing XML to structured data...", flush=True)
-            parsed_data = parse_llm_xml(xml_result)
-            
-            cover_url = ""
-            if parsed_data["cover"]["prompt"]:
-                sf_url = generate_cover_image(parsed_data["cover"]["prompt"])
-                cover_url = upload_to_imgbb_via_url(sf_url) if sf_url else ""
-            
-            render_feishu_card(parsed_data, today_str)
-            
-            if JIJYUN_WEBHOOK_URL:
-                html_content = render_wechat_html(parsed_data, cover_url)
-                wechat_title = parsed_data["cover"]["title"] or f"昨晚硅谷在聊啥 | {today_str}"
-                push_to_jijyun(html_content, title=wechat_title, cover_url=cover_url)
-                
-            save_daily_data(today_str, all_posts_flat, xml_result)
-            
-            print("\n🎉 V8.6 运行完毕！", flush=True)
+            parsed = parse_llm_xml(xml_result)
+            render_feishu_card(parsed, today_str)
+            print("\n🎉 V8.7 运行完毕！", flush=True)
         else:
-            print("❌ LLM 处理失败，任务终止。")
+            print("❌ LLM 处理失败。")
 
 if __name__ == "__main__":
     main()
