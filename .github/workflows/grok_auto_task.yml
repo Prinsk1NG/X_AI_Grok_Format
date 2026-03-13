@@ -1,4 +1,4 @@
-name: Silicon Valley Daily Report (Grok+xAI v8.0)
+name: Silicon Valley Daily Report (Grok+xAI v8.5)
 
 on:
   # 每天定时执行 (UTC时间 00:00，对应北京时间早上 08:00)
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       test_mode:
-        description: '开启测试模式 (只扫前14个人，快速验证排版)'
+        description: '开启测试模式 (只扫前6个人，快速验证排版)'
         required: false
         type: boolean
         default: false
@@ -31,10 +31,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           
-          # 🚨 核心改动 1：安装 playwright(网页自动化) 和 pynacl(自动更新Cookie密文)
+          # 🚨 安装 playwright(网页自动化) 和 pynacl(自动更新Cookie密文)
           pip install requests xai-sdk playwright pynacl
           
-          # 🚨 核心改动 2：安装 Chromium 浏览器内核供 Grok 抓取使用
+          # 🚨 安装 Chromium 浏览器内核供 Grok 抓取使用
           playwright install chromium
           
       - name: Run Auto Task Script
@@ -46,14 +46,19 @@ jobs:
           JIJYUN_WEBHOOK_URL: ${{ secrets.JIJYUN_WEBHOOK_URL }}
           TEST_MODE_ENV: ${{ github.event.inputs.test_mode }}
           
-          # 🚨 核心改动 3：引入 Grok 网页版身份凭证与 GitHub 自动续期 Token
+          # 🚨 核心改动：支持多号接力的 Cookie 配置矩阵
           SUPER_GROK_COOKIES: ${{ secrets.SUPER_GROK_COOKIES }}
+          SUPER_GROK_COOKIES_2: ${{ secrets.SUPER_GROK_COOKIES_2 }}
+          SUPER_GROK_COOKIES_3: ${{ secrets.SUPER_GROK_COOKIES_3 }}
+          SUPER_GROK_COOKIES_4: ${{ secrets.SUPER_GROK_COOKIES_4 }}
+          SUPER_GROK_COOKIES_5: ${{ secrets.SUPER_GROK_COOKIES_5 }}
+          
+          # 🚨 自动续期 Token 与仓库变量
           PAT_FOR_SECRETS: ${{ secrets.PAT_FOR_SECRETS }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           
         run: |
-          # 🚨 注意：请确保这里执行的文件名与你仓库里的 Python 主程序文件名完全一致！
-          # 如果你的文件叫 grok_auto_task.py，请将下面这行改成 python grok_auto_task.py
+          # 确保这里执行的文件名与你仓库里的 Python 主程序文件名完全一致！
           python grok_auto_task.py
 
       - name: Upload Data Artifact
@@ -61,6 +66,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: daily-data
-          # 🚨 硅谷版代码保存数据的文件夹名为 data
           path: data/
           retention-days: 7
