@@ -244,6 +244,7 @@ def wait_and_extract(page, label, interval=3, stable_rounds=4, max_wait=120, ext
             last_len = cur_len
     return last_text.strip()
 
+# 🚨 修复了正则匹配导致的 SyntaxError
 def parse_jsonlines(text: str) -> list:
     results = []
     # 去除可能存在的 markdown 包装块
